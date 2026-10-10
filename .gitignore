@@ -1,0 +1,15 @@
+# Generated output
+Output/
+
+# Logs
+*.log
+
+# Common temporary files
+*.tmp
+*.temp
+*.bak
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
