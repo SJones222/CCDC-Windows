@@ -72,7 +72,8 @@ function Get-ReviewIndicators {
             Reason = $Category + ' references a temporary directory.'
         }
     }
-    if ($text -match '(powershell(?:\.exe)?|pwsh(?:\.exe)?|cmd(?:\.exe)?|wscript(?:\.exe)?|cscript(?:\.exe)?|mshta(?:\.exe)?|python(?:\.exe)?|perl(?:\.exe)?|bash(?:\.exe)?)') {
+    $interpreterPattern = '(?<![a-z0-9_.-])(?:powershell|pwsh|cmd|wscript|cscript|mshta|python|perl|bash)(?:\.exe)?(?![a-z0-9_.-])'
+    if ($text -match $interpreterPattern) {
         $indicators += [pscustomobject][ordered]@{
             Indicator = 'ScriptInterpreter'
             Reason = $Category + ' uses a commonly observed script interpreter.'
@@ -590,6 +591,10 @@ foreach ($startupLocation in $startupPaths) {
         $folder = Get-Item -LiteralPath $startupLocation.Path -Force -ErrorAction Stop
         $locationCount = 0
         foreach ($file in @(Get-ChildItem -LiteralPath $startupLocation.Path -Force -File -ErrorAction Stop)) {
+            $startupIndicators = @()
+            if ($file.Name -ine 'desktop.ini') {
+                $startupIndicators = @(Get-ReviewIndicators 'Startup folder entry' $file.Name $file.FullName)
+            }
             $startupItems += [pscustomobject][ordered]@{
                 Category = 'StartupFolder'
                 Name = [string]$file.Name
@@ -597,7 +602,7 @@ foreach ($startupLocation in $startupPaths) {
                 Extension = [string]$file.Extension
                 LastWriteTime = $file.LastWriteTime.ToString('o')
                 Command = [string]$file.FullName
-                ReviewIndicators = @(Get-ReviewIndicators 'Startup folder entry' $file.Name $file.FullName)
+                ReviewIndicators = $startupIndicators
             }
             $locationCount++
         }
