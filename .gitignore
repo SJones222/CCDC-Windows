@@ -13,3 +13,18 @@ Output/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Local credentials and sensitive artifacts
+.env
+.env.*
+!.env.example
+*.pfx
+*.p12
+*.pem
+*.key
+*.token
+*.secret
+credentials.json
+secrets.json
+credentials/
+secrets/
