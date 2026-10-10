@@ -10,3 +10,9 @@ Audit/        Read-only security and configuration audit scripts
 Remediation/  Explicitly requested remediation scripts
 Tests/        Tests for implemented behavior
 ```
+
+## Network Inventory v0.1 baseline
+
+The initial tested baseline was executed successfully on a Windows Server 2025 domain controller in Kamino. Testing covered script execution, network configuration collection, TCP listeners, running services, firewall profiles, and successful report generation.
+
+Outstanding validation includes Windows client testing, non-elevated execution, and comprehensive output validation.
