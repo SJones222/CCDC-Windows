@@ -23,7 +23,7 @@ function Add-OutputIssue {
 
 function New-UniqueOutputDirectory {
     param([string]$Root, [string]$HostFolder)
-    $stamp = Get-Date -Format 'yyyyMMdd-HHmmssfff'
+    $stamp = 'NetworkInventory_' + (Get-Date -Format 'yyyyMMdd-HHmmssfff')
     $hostRoot = Join-Path $Root $HostFolder
     $candidate = Join-Path $hostRoot $stamp
     $suffix = 1
@@ -121,7 +121,7 @@ function Write-NetworkReports {
 }
 
 function Get-NetworkSummary {
-    param($Inventory, [array]$CollectionIssues, [array]$OutputIssues)
+    param($Inventory, [array]$CollectionIssues, [array]$OutputIssues, [switch]$Detailed)
     if ($Inventory.ReportSaved) { $saved = 'Yes' } else { $saved = 'No' }
     $lines = @(
         'Windows CCDC Network Inventory v0.1'
@@ -138,6 +138,59 @@ function Get-NetworkSummary {
         ('Running services: ' + $Inventory.Services.Status + ' (' + (Format-ResultCount $Inventory.Services) + ')')
         ('Firewall profiles: ' + $Inventory.FirewallProfiles.Status + ' (' + (Format-ResultCount $Inventory.FirewallProfiles) + ')')
     )
+
+    if ($Detailed) {
+        # A single default-route interface with a single IPv4 address is unambiguous.
+        # Do not choose between multiple interfaces/addresses using route metrics alone.
+        $defaultV4 = @($Inventory.Routes.IPv4.Items | Where-Object { $_.DestinationPrefix -eq '0.0.0.0/0' })
+        $defaultIndices = @($defaultV4 | Select-Object -ExpandProperty InterfaceIndex -Unique)
+        $primaryInterfaces = @($Inventory.Interfaces.Items | Where-Object { $_.InterfaceIndex -in $defaultIndices })
+        $primary = 'Unknown; see NETWORK CONFIGURATION'
+        if ($Inventory.Routes.IPv4.Status -eq 'Success' -and $Inventory.Interfaces.Status -eq 'Success' -and
+            $Inventory.InterfaceAddresses.Status -eq 'Success' -and $defaultIndices.Count -eq 1 -and
+            $primaryInterfaces.Count -eq 1 -and $null -ne $primaryInterfaces[0].IPv4Addresses -and
+            @($primaryInterfaces[0].IPv4Addresses).Count -eq 1) {
+            $primary = Format-AddressList $primaryInterfaces[0].IPv4Addresses
+        }
+        $configured = @($Inventory.Interfaces.Items | Where-Object {
+            ($null -ne $_.DefaultGateways -and @($_.DefaultGateways).Count -gt 0) -or
+            ($null -ne $_.IPv4Addresses -and @($_.IPv4Addresses).Count -gt 0) -or
+            ($null -ne $_.IPv6Addresses -and @($_.IPv6Addresses).Count -gt 0)
+        })
+        $gatewayOverview = 'Unknown; see NETWORK CONFIGURATION'
+        $dnsOverview = 'Unknown; see NETWORK CONFIGURATION'
+        if ($Inventory.GatewayDns.Status -eq 'Unavailable' -or $Inventory.Interfaces.Status -eq 'Unavailable') {
+            $gatewayOverview = '<unavailable>'
+            $dnsOverview = '<unavailable>'
+        }
+        elseif ($configured.Count -eq 1) {
+            $gatewayOverview = Format-TextList $configured[0].DefaultGateways
+            $dnsOverview = Format-TextList $configured[0].DNSServers
+        }
+        elseif ($configured.Count -gt 1) {
+            $gatewayOverview = 'Multiple interface configurations; see NETWORK CONFIGURATION'
+            $dnsOverview = $gatewayOverview
+        }
+        $firewallOverview = @($Inventory.FirewallProfiles.Items | ForEach-Object {
+            $_.ProfileName + '=' + (Format-Value $_.Enabled)
+        }) -join '; '
+        $lines = @(
+            ('Get-NetworkInventory.ps1 v' + $Inventory.Version)
+            ('Hostname: ' + (Format-Value $Inventory.Hostname) + '; Collected: ' + $Inventory.CollectedAt)
+            ('Report saved: ' + $saved + '; Output: ' + (Format-Value $Inventory.OutputDirectory))
+            ''
+            'AT A GLANCE'
+            ('Primary IPv4: ' + $primary)
+            ('Default gateway: ' + $gatewayOverview)
+            ('DNS servers: ' + $dnsOverview)
+            ('TCP listeners: ' + (Format-ResultCount $Inventory.Listeners.TCP) + '; UDP endpoints: ' + (Format-ResultCount $Inventory.Listeners.UDP))
+            ('Running services: ' + (Format-ResultCount $Inventory.Services))
+            ('Firewall enabled: ' + $firewallOverview)
+            ''
+            'NETWORK CONFIGURATION'
+            ('Interfaces: ' + $Inventory.Interfaces.Status + '; addresses: ' + $Inventory.InterfaceAddresses.Status + '; gateways/DNS: ' + $Inventory.GatewayDns.Status)
+        )
+    }
 
     $lines += ''
     $lines += 'Connected or operational interfaces:'
@@ -196,21 +249,43 @@ function Get-NetworkSummary {
         }
     }
 
+    if ($Detailed) {
+        $lines += ''
+        $lines += 'LISTENING TCP PORTS'
+        $lines += ('Total: ' + (Format-ResultCount $Inventory.Listeners.TCP) + '; status: ' + $Inventory.Listeners.TCP.Status)
+        if ($Inventory.Listeners.TCP.Status -ne 'Unavailable') {
+            $lines += ('Displayed listeners: ' + $Inventory.Listeners.TCP.Count + ' (all collected TCP listeners)')
+        }
+        $lines += 'Services are associated by PID; shared processes do not establish individual service socket ownership.'
+        $lines += 'A local listener does not establish external reachability.'
+    }
+    $listenerLabel = if ($Detailed) { 'TCP listeners' } else { 'TCP listener preview' }
     if ($Inventory.Listeners.TCP.Status -eq 'Unavailable') {
         $lines += ''
-        $lines += 'TCP listener preview: unavailable'
+        $lines += $listenerLabel + ': unavailable'
     }
     elseif ($Inventory.Listeners.TCP.Count -eq 0) {
         $lines += ''
-        $lines += 'TCP listener preview: none'
+        $lines += $listenerLabel + ': none'
     }
     else {
         $lines += ''
-        $lines += 'TCP listener preview (first 20 by local port; PID associations are not proof of ownership):'
-        $previewRows = @($Inventory.Listeners.TCP.Items |
-            Sort-Object @{ Expression = { if ($null -eq $_.LocalPort) { [int]::MaxValue } else { [int]$_.LocalPort } } }, LocalAddress |
-            Select-Object -First 20 |
-            ForEach-Object {
+        $preview = @($Inventory.Listeners.TCP.Items |
+            Sort-Object @{ Expression = { if ($null -eq $_.LocalPort) { [int]::MaxValue } else { [int]$_.LocalPort } } }, LocalAddress)
+        if ($Detailed) {
+            $lines += 'All TCP listeners, sorted by port, then address:'
+            $tableText = ($preview | Format-Table -Wrap -Property @(
+                @{ Label = 'PORT'; Expression = { Format-Value $_.LocalPort }; Width = 5 }
+                @{ Label = 'ADDRESS'; Expression = { Format-Value $_.LocalAddress }; Width = 39 }
+                @{ Label = 'PID'; Expression = { Format-Value $_.ProcessId }; Width = 8 }
+                @{ Label = 'PROCESS'; Expression = { Format-Value $_.ProcessName }; Width = 18 }
+                @{ Label = 'ASSOCIATED SERVICES'; Expression = { Format-TextList $_.AssociatedServiceNames }; Width = 26 }
+            ) | Out-String -Width 110).TrimEnd()
+        }
+        else {
+            $lines += 'TCP listener preview (first 20 by port, then address; PID associations are not proof of ownership):'
+            $preview = @($preview | Select-Object -First 20)
+            $previewRows = @($preview | ForEach-Object {
                 [pscustomobject][ordered]@{
                     Address = Format-Value $_.LocalAddress
                     Port = Format-Value $_.LocalPort
@@ -218,20 +293,91 @@ function Get-NetworkSummary {
                     'PID-associated services' = ($_.AssociatedServiceNames -join '; ')
                 }
             })
-        $tableText = ($previewRows | Format-Table -AutoSize | Out-String -Width 240).TrimEnd()
+            $tableText = ($previewRows | Format-Table -AutoSize | Out-String -Width 240).TrimEnd()
+        }
         $lines += $tableText
-        if ($Inventory.Listeners.TCP.Count -gt 20) {
-            $lines += ('... ' + ($Inventory.Listeners.TCP.Count - 20) + ' additional TCP listeners are in listeners.csv and network.json')
+        if (-not $Detailed -and $Inventory.Listeners.TCP.Count -gt 20) {
+            $lines += ('... ' + ($Inventory.Listeners.TCP.Count - 20) + ' additional TCP listeners omitted from this preview; see summary.txt, listeners.csv and network.json')
+        }
+    }
+
+    if ($Detailed) {
+        $lines += ''
+        $lines += 'UDP SUMMARY'
+        $lines += ('Total endpoints: ' + (Format-ResultCount $Inventory.Listeners.UDP) + '; status: ' + $Inventory.Listeners.UDP.Status)
+        $lines += 'Aggregate only: top 10 processes by endpoint count, not individual UDP ports.'
+        if ($Inventory.Listeners.UDP.Status -ne 'Unavailable' -and $Inventory.Listeners.UDP.Count -gt 0) {
+            $udpGroups = @($Inventory.Listeners.UDP.Items | Group-Object ProcessId, ProcessName |
+                Sort-Object @{ Expression = { $_.Count }; Descending = $true }, Name)
+            $udpRows = $udpGroups | Select-Object -First 10 | ForEach-Object {
+                [pscustomobject][ordered]@{
+                    Process = Format-Value $_.Group[0].ProcessName
+                    PID = Format-Value $_.Group[0].ProcessId
+                    Endpoints = $_.Count
+                }
+            }
+            $lines += ($udpRows | Format-Table -AutoSize -Wrap | Out-String -Width 110).TrimEnd()
+            if ($udpGroups.Count -gt 10) {
+                $lines += (($udpGroups.Count - 10).ToString() + ' additional process groups omitted; see listeners.csv.')
+            }
+        }
+        $lines += ''
+        $lines += 'NETWORK-ASSOCIATED RUNNING SERVICES'
+        $lines += ('All running services: ' + (Format-ResultCount $Inventory.Services) + '; status: ' + $Inventory.Services.Status)
+        $lines += 'Subset associated by PID with TCP listeners; full details follow under ALL RUNNING SERVICES.'
+        if ($Inventory.Services.Status -eq 'Unavailable' -or $Inventory.Listeners.TCP.Status -eq 'Unavailable') {
+            $lines += 'Subset unavailable: service or TCP collection unavailable.'
+        }
+        else {
+            $tcpPids = @{}
+            foreach ($listener in $Inventory.Listeners.TCP.Items) {
+                if ($null -ne $listener.ProcessId -and $listener.ProcessId -gt 0) {
+                    $tcpPids[[string]$listener.ProcessId] = $true
+                }
+            }
+            $associated = @($Inventory.Services.Items | Where-Object { $tcpPids.ContainsKey([string]$_.ProcessId) } | Sort-Object ServiceName)
+            $lines += ('Associated running services: ' + $associated.Count + ' (first 20 shown)')
+            foreach ($service in @($associated | Select-Object -First 20)) {
+                $lines += ('- ' + $service.ServiceName + '; PID ' + (Format-Value $service.ProcessId))
+            }
+            if ($associated.Count -gt 20) {
+                $lines += (($associated.Count - 20).ToString() + ' additional associated services omitted from overview; all services are listed below.')
+            }
+        }
+        $lines += ''
+        $lines += 'ALL RUNNING SERVICES'
+        $lines += ('Total: ' + (Format-ResultCount $Inventory.Services) + '; status: ' + $Inventory.Services.Status)
+        if ($Inventory.Services.Status -eq 'Unavailable') {
+            $lines += 'Running services unavailable: ' + (Format-Value $Inventory.Services.Error)
+        }
+        elseif ($Inventory.Services.Count -eq 0) {
+            $lines += 'No running services collected.'
+        }
+        else {
+            foreach ($service in @($Inventory.Services.Items | Sort-Object ServiceName)) {
+                $lines += ('- ' + (Format-Value $service.ServiceName))
+                $lines += ('  Status: ' + (Format-Value $service.State) + '; startup: ' + (Format-Value $service.StartupType) + '; PID: ' + (Format-Value $service.ProcessId))
+                $lines += ('  Path: ' + (Format-Value $service.ExecutablePath))
+                $lines += ''
+            }
         }
     }
 
     $lines += ''
-    $lines += 'Firewall profiles:'
+    $lines += $(if ($Detailed) { 'WINDOWS FIREWALL' } else { 'Firewall profiles:' })
     foreach ($profile in $Inventory.FirewallProfiles.Items) {
         $lines += ('- ' + $profile.ProfileName + ': ' + $profile.Status +
             '; enabled=' + (Format-Value $profile.Enabled) +
             '; inbound=' + (Format-Value $profile.DefaultInboundAction) +
             '; outbound=' + (Format-Value $profile.DefaultOutboundAction))
+    }
+    if ($Detailed) {
+        $lines += ''
+        $lines += 'COLLECTION NOTES AND LIMITATIONS'
+        $lines += ('IPv4 routes: ' + $Inventory.Routes.IPv4.Status + ' (' + (Format-ResultCount $Inventory.Routes.IPv4) + '); IPv6 routes: ' + $Inventory.Routes.IPv6.Status + ' (' + (Format-ResultCount $Inventory.Routes.IPv6) + ')')
+        $lines += 'Only default routes are presented above; all collected routes and interfaces are in network.json.'
+        $lines += $Inventory.ServiceAssociationNote
+        $lines += 'Empty/none means queried with no matching entries; unavailable means collection or field lookup failed.'
     }
     if ($CollectionIssues.Count -gt 0) {
         $lines += ''
@@ -245,6 +391,14 @@ function Get-NetworkSummary {
     }
     $lines += ''
     $lines += ('Output directory: ' + (Format-Value $Inventory.OutputDirectory))
+    if ($Detailed) {
+        $lines += ''
+        $lines += 'REPORT FILE REFERENCES'
+        $lines += 'summary.txt: curated presentation; presentation limits do not limit collection.'
+        $lines += 'listeners.csv: complete collected TCP/UDP endpoint mapping.'
+        $lines += 'running-services.csv: complete collected running-service inventory.'
+        $lines += 'network.json: complete structured network inventory, collection statuses, and errors.'
+    }
     return ($lines -join [Environment]::NewLine)
 }
 
@@ -673,13 +827,13 @@ $inventory = [ordered]@{
     OutputDirectory = $outputDirectory
     ReportSaved = $false
 }
-$summaryText = Get-NetworkSummary $inventory $CollectionIssues $OutputIssues
+$summaryText = Get-NetworkSummary $inventory $CollectionIssues $OutputIssues -Detailed
 $jsonText = $inventory | ConvertTo-Json -Depth 10
 
 if ($outputDirectory) {
     try {
         $inventory.ReportSaved = $true
-        $summaryText = Get-NetworkSummary $inventory $CollectionIssues $OutputIssues
+        $summaryText = Get-NetworkSummary $inventory $CollectionIssues $OutputIssues -Detailed
         $jsonText = $inventory | ConvertTo-Json -Depth 10
         Write-NetworkReports $outputDirectory $summaryText $jsonText $listenerCsvRows $serviceCsvRows
         $outputSaved = $true
@@ -698,7 +852,7 @@ if (-not $outputDirectory) {
         $inventory.OutputDirectory = $outputDirectory
         $inventory.OutputIssues = @($OutputIssues)
         $inventory.ReportSaved = $true
-        $summaryText = Get-NetworkSummary $inventory $CollectionIssues $OutputIssues
+        $summaryText = Get-NetworkSummary $inventory $CollectionIssues $OutputIssues -Detailed
         $jsonText = $inventory | ConvertTo-Json -Depth 10
         Write-NetworkReports $outputDirectory $summaryText $jsonText $listenerCsvRows $serviceCsvRows
         $outputSaved = $true
