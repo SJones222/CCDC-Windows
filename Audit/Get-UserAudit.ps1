@@ -23,7 +23,7 @@ function Add-OutputIssue {
 
 function New-UniqueOutputDirectory {
     param([string]$Root, [string]$HostFolder)
-    $stamp = Get-Date -Format 'yyyyMMdd-HHmmssfff'
+    $stamp = 'UserAudit_' + (Get-Date -Format 'yyyyMMdd-HHmmssfff')
     $hostRoot = Join-Path $Root $HostFolder
     $candidate = Join-Path $hostRoot $stamp
     $suffix = 1
@@ -120,7 +120,7 @@ function Write-AuditReports {
 }
 
 function Get-UserAuditSummary {
-    param($Audit, [array]$CollectionIssues, [array]$OutputIssues)
+    param($Audit, [array]$CollectionIssues, [array]$OutputIssues, [switch]$Detailed)
     $saved = if ($Audit.ReportSaved) { 'Yes' } else { 'No' }
     $lines = @(
         'Windows CCDC User Audit v0.1'
@@ -150,14 +150,74 @@ function Get-UserAuditSummary {
         $lines += ('- Password not required: ' + $noPasswordRequired)
     }
 
+    if ($Detailed) {
+        $scope = if ($Audit.DomainRoleCode -in @(4, 5)) { 'Domain accounts (domain controller)' }
+            elseif ($Audit.DomainRoleCode -in @(0, 1, 2, 3)) { 'Local accounts (workstation/member or standalone server)' }
+            else { '<unavailable: machine role not determined>' }
+        $members = @($Audit.PrivilegedGroups.Items | ForEach-Object { $_.DirectMembers })
+        $membershipCount = if ($Audit.PrivilegedGroups.Status -eq 'Unavailable' -and $members.Count -eq 0) { '<unavailable>' } else { [string]$members.Count }
+        $reviewAccounts = @($Audit.Users.Items | Where-Object { $_.ReviewIndicators.Count -gt 0 } | Sort-Object Principal, SID)
+        $indicatorCount = 0
+        foreach ($account in $reviewAccounts) {
+            $indicatorCount += $account.ReviewIndicators.Count
+        }
+        $reviewOverview = if ($Audit.Users.Status -eq 'Unavailable') { '<unavailable>' }
+            else { $reviewAccounts.Count.ToString() + ' accounts; ' + $indicatorCount + ' indicator occurrences' }
+        $lines = @(
+            'REPORT HEADER'
+            ('Get-UserAudit.ps1 v' + (Format-Value $Audit.Version))
+            ('Report saved: ' + $saved)
+            ''
+            'AT A GLANCE'
+            ('Hostname: ' + (Format-Value $Audit.Hostname) + '; collected: ' + (Format-Value $Audit.CollectedAt))
+            ('Domain: ' + (Format-Value $Audit.Domain) + '; domain membership: ' + (Format-Value $Audit.DomainMembership))
+            ('Machine role: ' + (Format-Value $Audit.MachineRole))
+            ('Account scope: ' + $scope)
+            ('Accounts: ' + $Audit.Users.Status + ' (' + (Format-Value $Audit.Users.Count) + ')')
+            ('Privileged groups: ' + $Audit.PrivilegedGroups.Status + ' (' + (Format-Value $Audit.PrivilegedGroups.Count) + ')')
+            ('Collected direct membership entries: ' + $membershipCount + ' (not unique accounts; group status applies)')
+            ('Existing review indicators: ' + $reviewOverview)
+            ('Collection issues reported: ' + $CollectionIssues.Count + '; see COLLECTION NOTES AND LIMITATIONS')
+            ('Output directory: ' + (Format-Value $Audit.OutputDirectory))
+            ''
+            'ACCOUNTS TO REVIEW'
+            'Existing indicators are review prompts; they do not establish malicious activity.'
+        )
+        if ($Audit.Users.Status -eq 'Unavailable') {
+            $lines += 'Unavailable: account collection failed or could not run.'
+        }
+        elseif ($reviewAccounts.Count -eq 0) {
+            $lines += 'No collected accounts have existing review indicators.'
+        }
+        foreach ($account in $reviewAccounts) {
+            $lines += ('- ' + (Format-Value $account.Principal) + '; SID: ' + (Format-Value $account.SID))
+            $lines += ('  Indicators: ' + ($account.ReviewIndicators -join '; '))
+        }
+    }
+
     $lines += ''
-    $lines += 'Privileged group memberships (direct members only):'
+    $lines += $(if ($Detailed) { 'PRIVILEGED GROUP MEMBERSHIP' } else { 'Privileged groups (direct membership counts; full details in summary.txt):' })
+    if ($Detailed) {
+        $lines += ('Collection status: ' + $Audit.PrivilegedGroups.Status)
+        if ($Audit.PrivilegedGroups.Error) { $lines += 'Error: ' + $Audit.PrivilegedGroups.Error }
+    }
     foreach ($group in $Audit.PrivilegedGroups.Items) {
         $lines += ('- ' + $group.GroupName + ': ' + $group.Status)
-        if ($group.Status -eq 'Available' -and @($group.DirectMembers).Count -gt 0) {
-            foreach ($member in $group.DirectMembers) {
-                $lines += ('  - ' + (Format-Value $member.MemberName) +
-                    ' [' + (Format-Value $member.MemberType) + ']')
+        if ($Detailed) {
+            $lines += ('  Group SID: ' + (Format-Value $group.GroupSID) + '; resolved name: ' + (Format-Value $group.ResolvedGroupName))
+            if ($group.Error) { $lines += '  Error: ' + $group.Error }
+        }
+        if (@($group.DirectMembers).Count -gt 0) {
+            if ($Detailed) {
+                foreach ($member in $group.DirectMembers) {
+                    $lines += ('  - ' + (Format-Value $member.MemberName) + ' [' + (Format-Value $member.MemberType) + ']')
+                    $lines += ('    SID: ' + (Format-Value $member.MemberSID))
+                    $lines += ('    Source: ' + (Format-Value $member.PrincipalSource) + '; resolution: ' + (Format-Value $member.ResolutionStatus))
+                    if ($member.DistinguishedName) { $lines += '    DN: ' + $member.DistinguishedName }
+                }
+            }
+            else {
+                $lines += ('  Direct members: ' + @($group.DirectMembers).Count)
             }
         }
         elseif ($group.Status -eq 'Available') {
@@ -166,6 +226,32 @@ function Get-UserAuditSummary {
     }
     $lines += 'Nested membership is not resolved; direct group membership is reported only.'
 
+    if ($Detailed) {
+        $lines += ''
+        $lines += 'ALL AUDITED ACCOUNTS'
+        $lines += ('Collection status: ' + $Audit.Users.Status + '; count: ' + (Format-Value $Audit.Users.Count))
+        if ($Audit.Users.Error) { $lines += 'Error: ' + $Audit.Users.Error }
+        if ($Audit.Users.Status -eq 'Empty') { $lines += 'No accounts returned by the successful query.' }
+        foreach ($account in @($Audit.Users.Items | Sort-Object Principal, SID)) {
+            $lines += ''
+            $lines += ('- ' + (Format-Value $account.Name) + ' [' + (Format-Value $account.AccountType) + ']')
+            $lines += ('  Principal: ' + (Format-Value $account.Principal) + '; domain: ' + (Format-Value $account.Domain))
+            $lines += ('  SID: ' + (Format-Value $account.SID))
+            $lines += ('  Enabled: ' + (Format-Value $account.Enabled) + '; disabled: ' + (Format-Value $account.Disabled))
+            $lines += ('  Password required: ' + (Format-Value $account.PasswordRequired) + '; password never expires: ' + (Format-Value $account.PasswordNeverExpires))
+            $lines += ('  Last logon: ' + (Format-Value $account.LastLogon))
+            $indicators = if ($account.ReviewIndicators.Count -gt 0) { $account.ReviewIndicators -join '; ' } else { '<none>' }
+            $lines += ('  Review indicators: ' + $indicators)
+        }
+        $lines += ''
+        $lines += 'COLLECTION NOTES AND LIMITATIONS'
+        $lines += 'Domain controllers use ActiveDirectory for domain users/groups; other known roles audit local users and local Administrators.'
+        $lines += ('ActiveDirectory module: ' + (Format-Value $Audit.ActiveDirectoryModuleStatus))
+        $lines += 'Only direct privileged-group members are collected; nested/effective privileges are not resolved.'
+        $lines += 'Partial means available results have collection limitations; unavailable is not a confirmed empty result.'
+        $lines += '<unavailable> fields were not supplied; a missing last logon does not prove the account never logged on.'
+        if ($CollectionIssues.Count -eq 0) { $lines += 'No collection issues reported.' }
+    }
     if ($CollectionIssues.Count -gt 0) {
         $lines += ''
         $lines += 'Collection issues:'
@@ -178,6 +264,14 @@ function Get-UserAuditSummary {
     }
     $lines += ''
     $lines += ('Output directory: ' + (Format-Value $Audit.OutputDirectory))
+    if ($Detailed) {
+        $lines += ''
+        $lines += 'REPORT FILE REFERENCES'
+        $lines += 'summary.txt: complete human-readable account and direct privileged-membership report.'
+        $lines += 'users.json: complete structured audit, collection statuses, and issues.'
+        $lines += 'accounts.csv: complete collected account inventory and existing review indicators.'
+        $lines += 'privileged-members.csv: collected direct privileged-group membership entries.'
+    }
     return ($lines -join [Environment]::NewLine)
 }
 
@@ -595,13 +689,13 @@ $audit = [ordered]@{
     OutputDirectory = $outputDirectory
     ReportSaved = $false
 }
-$summaryText = Get-UserAuditSummary $audit $CollectionIssues $OutputIssues
+$summaryText = Get-UserAuditSummary $audit $CollectionIssues $OutputIssues -Detailed
 $jsonText = $audit | ConvertTo-Json -Depth 10
 
 if ($outputDirectory) {
     try {
         $audit.ReportSaved = $true
-        $summaryText = Get-UserAuditSummary $audit $CollectionIssues $OutputIssues
+        $summaryText = Get-UserAuditSummary $audit $CollectionIssues $OutputIssues -Detailed
         $jsonText = $audit | ConvertTo-Json -Depth 10
         Write-AuditReports $outputDirectory $summaryText $jsonText $accountRows $privilegedRows
         $outputSaved = $true
@@ -620,7 +714,7 @@ if (-not $outputDirectory) {
         $audit.OutputDirectory = $outputDirectory
         $audit.OutputIssues = @($OutputIssues)
         $audit.ReportSaved = $true
-        $summaryText = Get-UserAuditSummary $audit $CollectionIssues $OutputIssues
+        $summaryText = Get-UserAuditSummary $audit $CollectionIssues $OutputIssues -Detailed
         $jsonText = $audit | ConvertTo-Json -Depth 10
         Write-AuditReports $outputDirectory $summaryText $jsonText $accountRows $privilegedRows
         $outputSaved = $true
