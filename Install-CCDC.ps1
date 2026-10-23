@@ -38,6 +38,13 @@ $requiredFiles = @(
     'AGENTS.md'
     'Install-CCDC.ps1'
 )
+$rootCopies = [ordered]@{
+    'network.ps1' = 'Inventory\Get-NetworkInventory.ps1'
+    'system.ps1' = 'Inventory\Get-SystemInventory.ps1'
+    'users.ps1' = 'Audit\Get-UserAudit.ps1'
+    'persistence.ps1' = 'Audit\Get-PersistenceAudit.ps1'
+    'events.ps1' = 'Audit\Get-SecurityEventTriage.ps1'
+}
 $temporaryDirectory = $null
 $pendingDirectory = $null
 $previousTls = [Net.ServicePointManager]::SecurityProtocol
@@ -96,6 +103,11 @@ try {
         New-Item -ItemType Directory -Path (Join-Path $pendingDirectory $directory) -Force -ErrorAction Stop | Out-Null
     }
 
+    $step = 'root-level standalone script copies'
+    foreach ($name in $rootCopies.Keys) {
+        [IO.File]::Copy((Join-Path $pendingDirectory $rootCopies[$name]), (Join-Path $pendingDirectory $name), $false)
+    }
+
     $step = 'installation promotion'
     if (Test-Path -LiteralPath $destinationPath -ErrorAction Stop) {
         throw ('Destination already exists: ' + $destinationPath + '. Choose a different -Destination; existing contents were not changed.')
@@ -127,16 +139,17 @@ Write-Output ('Destination: ' + $destinationPath)
 Write-Output ('Source: https://github.com/' + $repository + '; branch: ' + $Ref)
 Write-Output 'No audit or remediation scripts were executed. No Windows security settings were changed.'
 Write-Output ''
-Write-Output 'Installed scripts:'
-foreach ($relativePath in $requiredFiles | Where-Object { $_ -like 'Inventory\*' -or $_ -like 'Audit\*' }) {
-    Write-Output ('- ' + (Join-Path $destinationPath $relativePath))
+Write-Output 'Installed standalone copies and preserved originals:'
+foreach ($name in $rootCopies.Keys) {
+    Write-Output ('- ' + (Join-Path $destinationPath $name))
+    Write-Output ('  Original: ' + (Join-Path $destinationPath $rootCopies[$name]))
 }
 Write-Output ''
 Write-Output 'Run from Windows PowerShell:'
 Write-Output ("Set-Location -LiteralPath '" + $destinationPath.Replace("'", "''") + "'")
-Write-Output '.\Inventory\Get-SystemInventory.ps1'
-Write-Output '.\Inventory\Get-NetworkInventory.ps1'
-Write-Output '.\Audit\Get-UserAudit.ps1'
-Write-Output '.\Audit\Get-PersistenceAudit.ps1'
-Write-Output '.\Audit\Get-SecurityEventTriage.ps1'
-Write-Output '.\Audit\Get-SecurityEventTriage.ps1 -Deep'
+Write-Output '.\network.ps1'
+Write-Output '.\system.ps1'
+Write-Output '.\users.ps1'
+Write-Output '.\persistence.ps1'
+Write-Output '.\events.ps1'
+Write-Output '.\events.ps1 -Deep'
