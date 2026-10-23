@@ -163,6 +163,16 @@ function Get-UserAuditSummary {
         }
         $reviewOverview = if ($Audit.Users.Status -eq 'Unavailable') { '<unavailable>' }
             else { $reviewAccounts.Count.ToString() + ' accounts; ' + $indicatorCount + ' indicator occurrences' }
+        $accountsAvailable = $Audit.Users.Status -in @('Success', 'Partial', 'Empty')
+        $auditedAccounts = @($Audit.Users.Items | Where-Object { $null -ne $_ })
+        $enabledAccounts = @($auditedAccounts | Where-Object { $_.Enabled -eq $true } | Sort-Object Name, Principal, SID)
+        $statusCounts = 'Total audited accounts: <unavailable>; enabled: <unavailable>; disabled: <unavailable>; unknown enabled status: <unavailable>'
+        if ($accountsAvailable) {
+            $disabledCount = @($auditedAccounts | Where-Object { $_.Enabled -eq $false }).Count
+            $unknownCount = $auditedAccounts.Count - $enabledAccounts.Count - $disabledCount
+            $statusCounts = 'Total audited accounts: ' + $auditedAccounts.Count + '; enabled: ' + $enabledAccounts.Count + '; disabled: ' + $disabledCount
+            if ($unknownCount -gt 0) { $statusCounts += '; unknown enabled status: ' + $unknownCount }
+        }
         $lines = @(
             'REPORT HEADER'
             ('Get-UserAudit.ps1 v' + (Format-Value $Audit.Version))
@@ -174,11 +184,28 @@ function Get-UserAuditSummary {
             ('Machine role: ' + (Format-Value $Audit.MachineRole))
             ('Account scope: ' + $scope)
             ('Accounts: ' + $Audit.Users.Status + ' (' + (Format-Value $Audit.Users.Count) + ')')
+            $statusCounts
             ('Privileged groups: ' + $Audit.PrivilegedGroups.Status + ' (' + (Format-Value $Audit.PrivilegedGroups.Count) + ')')
             ('Collected direct membership entries: ' + $membershipCount + ' (not unique accounts; group status applies)')
             ('Existing review indicators: ' + $reviewOverview)
             ('Collection issues reported: ' + $CollectionIssues.Count + '; see COLLECTION NOTES AND LIMITATIONS')
             ('Output directory: ' + (Format-Value $Audit.OutputDirectory))
+            ''
+            'ENABLED ACCOUNTS'
+            'Enabled=True does not guarantee logon access to a particular machine.'
+        )
+        if (-not $accountsAvailable) {
+            $lines += 'Unavailable: enabled accounts could not be determined.'
+        }
+        elseif ($enabledAccounts.Count -eq 0) {
+            $lines += $(if ($Audit.Users.Status -eq 'Partial') { 'No enabled accounts in the collected partial results.' } else { 'No enabled accounts returned by the successful collection.' })
+        }
+        else {
+            foreach ($account in $enabledAccounts) {
+                $lines += ('- ' + (Format-Value $account.Name) + '; principal: ' + (Format-Value $account.Principal))
+            }
+        }
+        $lines += @(
             ''
             'ACCOUNTS TO REVIEW'
             'Existing indicators are review prompts; they do not establish malicious activity.'
@@ -189,7 +216,10 @@ function Get-UserAuditSummary {
         elseif ($reviewAccounts.Count -eq 0) {
             $lines += 'No collected accounts have existing review indicators.'
         }
+        $firstReviewAccount = $true
         foreach ($account in $reviewAccounts) {
+            if (-not $firstReviewAccount) { $lines += '' }
+            $firstReviewAccount = $false
             $lines += ('- ' + (Format-Value $account.Principal) + '; SID: ' + (Format-Value $account.SID))
             $lines += ('  Indicators: ' + ($account.ReviewIndicators -join '; '))
         }
@@ -201,7 +231,10 @@ function Get-UserAuditSummary {
         $lines += ('Collection status: ' + $Audit.PrivilegedGroups.Status)
         if ($Audit.PrivilegedGroups.Error) { $lines += 'Error: ' + $Audit.PrivilegedGroups.Error }
     }
+    $firstGroup = $true
     foreach ($group in $Audit.PrivilegedGroups.Items) {
+        if ($Detailed -and -not $firstGroup) { $lines += '' }
+        $firstGroup = $false
         $lines += ('- ' + $group.GroupName + ': ' + $group.Status)
         if ($Detailed) {
             $lines += ('  Group SID: ' + (Format-Value $group.GroupSID) + '; resolved name: ' + (Format-Value $group.ResolvedGroupName))
@@ -209,7 +242,10 @@ function Get-UserAuditSummary {
         }
         if (@($group.DirectMembers).Count -gt 0) {
             if ($Detailed) {
+                $firstMember = $true
                 foreach ($member in $group.DirectMembers) {
+                    if (-not $firstMember) { $lines += '' }
+                    $firstMember = $false
                     $lines += ('  - ' + (Format-Value $member.MemberName) + ' [' + (Format-Value $member.MemberType) + ']')
                     $lines += ('    SID: ' + (Format-Value $member.MemberSID))
                     $lines += ('    Source: ' + (Format-Value $member.PrincipalSource) + '; resolution: ' + (Format-Value $member.ResolutionStatus))
