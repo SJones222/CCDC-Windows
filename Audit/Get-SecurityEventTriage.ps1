@@ -426,6 +426,24 @@ function Get-TriageSummary {
                         $lines += ('  ' + $field + ': ' + [string]$event.$field)
                     }
                 }
+                if ($event.Category -eq 'Defender' -and $event.EventId -eq 5007) {
+                    # Check key presence directly so absent and empty values remain distinct.
+                    foreach ($field in @('Old Value', 'New Value')) {
+                        $value = if ($null -eq $event.EventData -or -not $event.EventData.Contains($field)) {
+                            '<absent>'
+                        }
+                        elseif ($null -eq $event.EventData[$field]) {
+                            '<null>'
+                        }
+                        elseif ([string]$event.EventData[$field] -eq '') {
+                            '<empty string>'
+                        }
+                        else {
+                            [string]$event.EventData[$field]
+                        }
+                        $lines += ('  ' + $field + ': ' + $value)
+                    }
+                }
             }
             else {
                 $lines += ('  Actor: ' + (Format-Value $event.Actor) + '; Target: ' + (Format-Value $event.Target) + '; Source: ' + (Format-Value $event.SourceIpAddress))
