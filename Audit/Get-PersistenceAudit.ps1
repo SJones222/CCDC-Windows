@@ -30,7 +30,7 @@ function New-UniqueOutputDirectory {
         [string]$HostFolder
     )
 
-    $stamp = Get-Date -Format 'yyyyMMdd-HHmmssfff'
+    $stamp = 'PersistenceAudit_' + (Get-Date -Format 'yyyyMMdd-HHmmssfff')
     $hostRoot = Join-Path $Root $HostFolder
     $candidate = Join-Path $hostRoot $stamp
     $suffix = 1
@@ -422,7 +422,8 @@ function Get-PersistenceSummary {
     param(
         $Report,
         [array]$CollectionIssues,
-        [array]$OutputIssues
+        [array]$OutputIssues,
+        [switch]$Detailed
     )
 
     $saved = if ($Report.ReportSaved) { 'Yes' } else { 'No' }
@@ -430,36 +431,168 @@ function Get-PersistenceSummary {
         'Windows CCDC Persistence Audit v0.1'
         '===================================='
         ('Hostname: ' + (Format-Value $Report.Hostname))
-        ('Scheduled tasks: ' + $Report.ScheduledTasks.Status + ' (' + $Report.ScheduledTasks.Count + ')')
-        ('Registry autoruns: ' + $Report.RegistryAutoruns.Status + ' (' + $Report.RegistryAutoruns.Count + ')')
-        ('Startup files: ' + $Report.StartupFolders.Status + ' (' + $Report.StartupFolders.Count + ')')
-        ('Automatic services: ' + $Report.AutomaticServices.Status + ' (' + $Report.AutomaticServices.Count + ')')
-        ('WMI subscriptions: ' + $Report.WmiSubscriptions.Status + ' (' + $Report.WmiSubscriptions.Count + ')')
         ('Report saved: ' + $saved)
     )
+    if ($Detailed) {
+        $lines = @(
+            'REPORT HEADER'
+            ('Get-PersistenceAudit.ps1 v' + (Format-Value $Report.Version))
+            ('Hostname: ' + (Format-Value $Report.Hostname) + '; collected: ' + (Format-Value $Report.CollectedAt))
+            ('Report saved: ' + $saved)
+            ('Output directory: ' + (Format-Value $Report.OutputDirectory))
+            ''
+            'AT A GLANCE'
+        )
+    }
+    $categories = [ordered]@{
+        'Scheduled tasks' = $Report.ScheduledTasks
+        'Registry autoruns' = $Report.RegistryAutoruns
+        'Startup files' = $Report.StartupFolders
+        'Automatic services' = $Report.AutomaticServices
+        'WMI subscriptions' = $Report.WmiSubscriptions
+    }
+    foreach ($label in $categories.Keys) {
+        $result = $categories[$label]
+        $count = if ($result.Status -eq 'Unavailable') { '<unavailable>' } else { [string]$result.Count }
+        $lines += ($label + ': ' + $result.Status + ' (' + $count + ')')
+    }
+    if ($Detailed) {
+        $lines += ('Existing review candidates: ' + @($Report.ReviewCandidates).Count + ' (collected entries only)')
+        $lines += ('Collection issues: ' + $CollectionIssues.Count + '; see COLLECTION NOTES AND LIMITATIONS')
+    }
 
     $lines += ''
     $lines += 'WMI subscription summary:'
-    $lines += ('- Filters: ' + $Report.WmiSubscriptions.Filters.Count)
-    $lines += ('- Command-line consumers: ' + $Report.WmiSubscriptions.CommandLineConsumers.Count)
-    $lines += ('- ActiveScript consumers: ' + $Report.WmiSubscriptions.ActiveScriptConsumers.Count)
-    $lines += ('- Filter-to-consumer bindings: ' + $Report.WmiSubscriptions.Bindings.Count)
+    $wmiTypes = [ordered]@{
+        'Filters' = $Report.WmiSubscriptions.Filters
+        'Command-line consumers' = $Report.WmiSubscriptions.CommandLineConsumers
+        'ActiveScript consumers' = $Report.WmiSubscriptions.ActiveScriptConsumers
+        'Filter-to-consumer bindings' = $Report.WmiSubscriptions.Bindings
+    }
+    foreach ($type in $wmiTypes.Keys) {
+        $count = if ($Report.WmiSubscriptions.Status -eq 'Unavailable') { '<unavailable>' } else { [string]$wmiTypes[$type].Count }
+        $lines += ('- Collected ' + $type + ': ' + $count)
+    }
+    if ($Report.WmiSubscriptions.Status -eq 'Partial') {
+        $lines += '- Observed counts only; zero does not confirm absence for failed WMI queries.'
+    }
     $lines += '- Nested or unsupported consumer types are not expanded in v0.1.'
 
     $candidateCount = @($Report.ReviewCandidates).Count
     $lines += ''
-    $lines += ('Review candidates (first 10 of ' + $candidateCount + '):')
+    $lines += $(if ($Detailed) { 'ITEMS TO REVIEW (' + $candidateCount + ')' } else { 'Review candidates (first 10 of ' + $candidateCount + '):' })
+    if ($Detailed) {
+        $lines += 'Existing review candidates are not confirmed malicious activity; full entry details follow below.'
+    }
     if ($candidateCount -eq 0) {
-        $lines += '- none'
+        $lines += '- no review candidates among collected entries; collection status and coverage limitations still apply'
     }
     else {
-        foreach ($candidate in @($Report.ReviewCandidates | Select-Object -First 10)) {
+        $candidates = if ($Detailed) { @($Report.ReviewCandidates) } else { @($Report.ReviewCandidates | Select-Object -First 10) }
+        $firstCandidate = $true
+        foreach ($candidate in $candidates) {
+            if ($Detailed -and -not $firstCandidate) { $lines += '' }
+            $firstCandidate = $false
             $lines += ('- [' + $candidate.Category + '] ' + (Format-Value $candidate.Name))
             $lines += ('  Command: ' + (Format-Value $candidate.Command))
             foreach ($reason in @($candidate.Reasons)) {
                 $lines += ('  Reason: ' + $reason)
             }
         }
+    }
+
+    if ($Detailed) {
+        $lines += ''
+        $lines += 'DETAILED PERSISTENCE INVENTORY'
+        foreach ($label in $categories.Keys) {
+            $result = $categories[$label]
+            $lines += ''
+            $lines += $label.ToUpperInvariant()
+            $count = if ($result.Status -eq 'Unavailable') { '<unavailable>' } else { [string]$result.Count }
+            $lines += ('Status: ' + $result.Status + '; collected entries: ' + $count)
+            if ($result.Error) { $lines += 'Error: ' + $result.Error }
+            if ($result.Status -eq 'Empty') { $lines += 'No entries returned by successful collection.' }
+            if ($result.Status -eq 'Partial') { $lines += 'Partial coverage; all retained entries follow. See collection issues below.' }
+            if ($label -in @('Registry autoruns', 'Startup files')) {
+                foreach ($location in $result.Locations) {
+                    $locationCount = if ($location.Status -eq 'Unavailable') { '<unavailable>' } else { [string]$location.Count }
+                    $lines += ('Location: ' + $location.Path + '; ' + $location.Status + ' (' + $locationCount + ')')
+                    if ($location.Note) { $lines += '  Note: ' + $location.Note }
+                    if ($location.Error) { $lines += '  Error: ' + $location.Error }
+                }
+            }
+            $items = if ($label -eq 'WMI subscriptions') {
+                @($result.Filters) + @($result.CommandLineConsumers) + @($result.ActiveScriptConsumers) + @($result.Bindings)
+            }
+            else { @($result.Items) }
+            foreach ($item in $items) {
+                $lines += ''
+                $lines += ('- [' + $item.Category + '] ' + (Format-Value $item.Name))
+                switch ($item.Category) {
+                    'ScheduledTask' {
+                        $lines += ('  Task path: ' + (Format-Value $item.TaskPath) + '; state: ' + (Format-Value $item.State) + '; enabled: ' + (Format-Value $item.Enabled))
+                        $lines += ('  Principal: ' + (Format-Value $item.Principal.UserId) + '; logon: ' + (Format-Value $item.Principal.LogonType) + '; run level: ' + (Format-Value $item.Principal.RunLevel) + '; token SID type: ' + (Format-Value $item.Principal.ProcessTokenSidType))
+                        $lines += ('  Collected actions: ' + @($item.Actions).Count + '; triggers: ' + @($item.Triggers).Count)
+                        foreach ($action in $item.Actions) {
+                            $lines += ('  Action [' + (Format-Value $action.Type) + ']: ' + (Format-Value $action.Execute))
+                            $lines += ('    Arguments: ' + (Format-Value $action.Arguments) + '; working directory: ' + (Format-Value $action.WorkingDirectory))
+                        }
+                        foreach ($trigger in $item.Triggers) {
+                            $lines += ('  Trigger [' + (Format-Value $trigger.Type) + ']; enabled: ' + (Format-Value $trigger.Enabled))
+                            $lines += ('    Start: ' + (Format-Value $trigger.StartBoundary) + '; end: ' + (Format-Value $trigger.EndBoundary) + '; user: ' + (Format-Value $trigger.UserId))
+                            $lines += ('    Delay: ' + (Format-Value $trigger.Delay) + '; random delay: ' + (Format-Value $trigger.RandomDelay))
+                            $lines += ('    Subscription: ' + (Format-Value $trigger.Subscription))
+                        }
+                        if ($item.CollectionError) { $lines += '  Collection error: ' + $item.CollectionError }
+                    }
+                    'RegistryAutorun' {
+                        $lines += ('  Registry path: ' + (Format-Value $item.RegistryPath))
+                        $valueName = if ($item.ValueName -eq '') { '(default value)' } else { Format-Value $item.ValueName }
+                        $lines += ('  Value: ' + $valueName + '; kind: ' + (Format-Value $item.ValueKind))
+                        $lines += ('  Command: ' + (Format-Value $item.Command))
+                    }
+                    'StartupFolder' {
+                        $lines += ('  Path: ' + (Format-Value $item.Path))
+                        $lines += ('  Extension: ' + (Format-Value $item.Extension) + '; modified: ' + (Format-Value $item.LastWriteTime))
+                    }
+                    'AutomaticService' {
+                        $lines += ('  Display name: ' + (Format-Value $item.DisplayName) + '; state: ' + (Format-Value $item.State) + '; startup: ' + (Format-Value $item.StartMode))
+                        $lines += ('  PID: ' + (Format-Value $item.ProcessId) + '; account: ' + (Format-Value $item.ServiceAccount))
+                        $lines += ('  Executable command path: ' + (Format-Value $item.PathName))
+                    }
+                    'WmiEventFilter' {
+                        $lines += ('  Query language: ' + (Format-Value $item.QueryLanguage))
+                        $lines += ('  Query: ' + (Format-Value $item.Query))
+                    }
+                    'WmiCommandLineConsumer' {
+                        $lines += ('  Executable: ' + (Format-Value $item.ExecutablePath))
+                        $lines += ('  Command template: ' + (Format-Value $item.CommandLineTemplate))
+                        $lines += ('  Working directory: ' + (Format-Value $item.WorkingDirectory))
+                    }
+                    'WmiActiveScriptConsumer' {
+                        $lines += ('  Language: ' + (Format-Value $item.ScriptLanguage) + '; script file: ' + (Format-Value $item.ScriptFileName))
+                        $lines += ('  Script text: ' + (Format-Value $item.ScriptText))
+                    }
+                    'WmiFilterToConsumerBinding' {
+                        $lines += ('  Filter: ' + (Format-Value $item.FilterReference))
+                        $lines += ('  Consumer: ' + (Format-Value $item.ConsumerReference))
+                    }
+                }
+                if ($item.Category -like 'Wmi*') { $lines += ('  Creator SID: ' + (Format-Value $item.CreatorSID)) }
+            }
+        }
+        $lines += ''
+        $lines += 'COLLECTION NOTES AND LIMITATIONS'
+        $lines += 'Point-in-time inventory; persistence entries and review indicators do not establish malicious activity.'
+        $lines += 'Empty means queried with no entries; Unavailable means collection failed; Partial means incomplete coverage.'
+        $lines += 'Counts under partial coverage describe retained records only; unavailable counts are not zero.'
+        $lines += '<unavailable> fields were not supplied or were empty; this report does not infer their values.'
+        $lines += ('HKCU: ' + $Report.RegistryAutoruns.HKCUContext)
+        $lines += ('Startup folders: common and current user only. ' + $Report.StartupFolders.Note)
+        $lines += ('WMI namespace: ' + $Report.WmiSubscriptions.Namespace + '. ' + $Report.WmiSubscriptions.NamespaceCoverage)
+        $lines += $Report.WmiSubscriptions.UnsupportedConsumerTypes
+        $lines += 'Review criteria are the existing user-writable/temp path, interpreter, and WMI consumer indicators; no scores are assigned.'
+        if ($CollectionIssues.Count -eq 0) { $lines += 'No collection failures reported.' }
     }
 
     if ($CollectionIssues.Count -gt 0) {
@@ -478,6 +611,13 @@ function Get-PersistenceSummary {
     }
     $lines += ''
     $lines += ('Output directory: ' + (Format-Value $Report.OutputDirectory))
+    if ($Detailed) {
+        $lines += ''
+        $lines += 'REPORT FILE REFERENCES'
+        $lines += 'summary.txt: human-readable inventory and existing review candidates, without entry limits.'
+        $lines += 'entries.csv: consistent flattened inventory across collected categories.'
+        $lines += 'persistence.json: complete structured inventory, task details, coverage metadata, and collection issues.'
+    }
     return ($lines -join [Environment]::NewLine)
 }
 
@@ -855,12 +995,12 @@ $report = [ordered]@{
     ReportSaved = $false
 }
 
-$summaryText = Get-PersistenceSummary $report $CollectionIssues $OutputIssues
+$summaryText = Get-PersistenceSummary $report $CollectionIssues $OutputIssues -Detailed
 $jsonText = $report | ConvertTo-Json -Depth 12
 if ($outputDirectory) {
     try {
         $report.ReportSaved = $true
-        $summaryText = Get-PersistenceSummary $report $CollectionIssues $OutputIssues
+        $summaryText = Get-PersistenceSummary $report $CollectionIssues $OutputIssues -Detailed
         $jsonText = $report | ConvertTo-Json -Depth 12
         Write-PersistenceReports $outputDirectory $summaryText $jsonText $entryRows
         $outputSaved = $true
@@ -879,7 +1019,7 @@ if (-not $outputDirectory) {
         $report.OutputDirectory = $outputDirectory
         $report.OutputIssues = @($OutputIssues)
         $report.ReportSaved = $true
-        $summaryText = Get-PersistenceSummary $report $CollectionIssues $OutputIssues
+        $summaryText = Get-PersistenceSummary $report $CollectionIssues $OutputIssues -Detailed
         $jsonText = $report | ConvertTo-Json -Depth 12
         Write-PersistenceReports $outputDirectory $summaryText $jsonText $entryRows
         $outputSaved = $true
