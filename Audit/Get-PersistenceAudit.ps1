@@ -531,17 +531,64 @@ function Get-PersistenceSummary {
                 switch ($item.Category) {
                     'ScheduledTask' {
                         $lines += ('  Task path: ' + (Format-Value $item.TaskPath) + '; state: ' + (Format-Value $item.State) + '; enabled: ' + (Format-Value $item.Enabled))
-                        $lines += ('  Principal: ' + (Format-Value $item.Principal.UserId) + '; logon: ' + (Format-Value $item.Principal.LogonType) + '; run level: ' + (Format-Value $item.Principal.RunLevel) + '; token SID type: ' + (Format-Value $item.Principal.ProcessTokenSidType))
+                        $principalDetails = @('  Principal: ' + (Format-Value $item.Principal.UserId))
+                        foreach ($field in @('LogonType', 'RunLevel', 'ProcessTokenSidType')) {
+                            if (-not [string]::IsNullOrWhiteSpace([string]$item.Principal.$field)) {
+                                $principalDetails += $field + ': ' + [string]$item.Principal.$field
+                            }
+                        }
+                        $lines += $principalDetails -join '; '
                         $lines += ('  Collected actions: ' + @($item.Actions).Count + '; triggers: ' + @($item.Triggers).Count)
                         foreach ($action in $item.Actions) {
-                            $lines += ('  Action [' + (Format-Value $action.Type) + ']: ' + (Format-Value $action.Execute))
-                            $lines += ('    Arguments: ' + (Format-Value $action.Arguments) + '; working directory: ' + (Format-Value $action.WorkingDirectory))
+                            $actionDetails = @('  Action [' + (Format-Value $action.Type) + ']')
+                            if (-not [string]::IsNullOrWhiteSpace([string]$action.Execute)) {
+                                $actionDetails += 'Executable: ' + $action.Execute
+                            }
+                            elseif ($action.Type -eq 'MSFT_TaskComHandlerAction') {
+                                $actionDetails = @('  Action: COM handler (executable not collected)')
+                            }
+                            foreach ($field in @('Arguments', 'WorkingDirectory')) {
+                                if (-not [string]::IsNullOrWhiteSpace([string]$action.$field)) {
+                                    $actionDetails += $field + ': ' + [string]$action.$field
+                                }
+                            }
+                            $lines += $actionDetails -join '; '
                         }
                         foreach ($trigger in $item.Triggers) {
-                            $lines += ('  Trigger [' + (Format-Value $trigger.Type) + ']; enabled: ' + (Format-Value $trigger.Enabled))
-                            $lines += ('    Start: ' + (Format-Value $trigger.StartBoundary) + '; end: ' + (Format-Value $trigger.EndBoundary) + '; user: ' + (Format-Value $trigger.UserId))
-                            $lines += ('    Delay: ' + (Format-Value $trigger.Delay) + '; random delay: ' + (Format-Value $trigger.RandomDelay))
-                            $lines += ('    Subscription: ' + (Format-Value $trigger.Subscription))
+                            $triggerDetails = @('  Trigger [' + (Format-Value $trigger.Type) + ']')
+                            foreach ($field in @('Enabled', 'StartBoundary', 'EndBoundary', 'UserId', 'Delay', 'RandomDelay')) {
+                                if (-not [string]::IsNullOrWhiteSpace([string]$trigger.$field)) {
+                                    $triggerDetails += $field + ': ' + [string]$trigger.$field
+                                }
+                            }
+                            $lines += $triggerDetails -join '; '
+                            if (-not [string]::IsNullOrWhiteSpace([string]$trigger.Subscription)) {
+                                $subscription = [string]$trigger.Subscription
+                                $subscriptionLabel = '    Subscription: '
+                                try {
+                                    # Only remove layout whitespace from the element-only QueryList/Query containers.
+                                    # Keep XPath text, CDATA and xml:space="preserve" content intact; skip DTDs.
+                                    if (-not $subscription.Contains('<!DOCTYPE')) {
+                                        $xml = New-Object System.Xml.XmlDocument
+                                        $xml.PreserveWhitespace = $true
+                                        $xml.XmlResolver = $null
+                                        $xml.LoadXml($subscription)
+                                        $layoutNodes = @($xml.SelectNodes('/QueryList/text() | /QueryList/Query/text()'))
+                                        $layoutRemoved = $false
+                                        foreach ($node in $layoutNodes) {
+                                            if ($node.NodeType -eq [System.Xml.XmlNodeType]::Whitespace) {
+                                                [void]$node.ParentNode.RemoveChild($node)
+                                                $layoutRemoved = $true
+                                            }
+                                        }
+                                        if ($layoutRemoved) { $subscription = $xml.OuterXml }
+                                    }
+                                }
+                                catch {
+                                    $subscriptionLabel = '    Subscription (original XML; compaction unavailable): '
+                                }
+                                $lines += $subscriptionLabel + $subscription
+                            }
                         }
                         if ($item.CollectionError) { $lines += '  Collection error: ' + $item.CollectionError }
                     }
