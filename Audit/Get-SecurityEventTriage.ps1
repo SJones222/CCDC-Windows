@@ -37,7 +37,7 @@ function New-UniqueOutputDirectory {
         [string]$HostFolder
     )
 
-    $stamp = Get-Date -Format 'yyyyMMdd-HHmmssfff'
+    $stamp = 'SecurityEventTriage_' + (Get-Date -Format 'yyyyMMdd-HHmmssfff')
     $hostRoot = Join-Path $Root $HostFolder
     $candidate = Join-Path $hostRoot $stamp
     $suffix = 1
@@ -336,10 +336,16 @@ function Get-TriageSummary {
     param(
         $Report,
         [array]$CollectionIssues,
-        [array]$OutputIssues
+        [array]$OutputIssues,
+        [switch]$Detailed
     )
 
     $saved = if ($Report.ReportSaved) { 'Yes' } else { 'No' }
+    $securityChanges = @($Report.Events | Where-Object {
+        $_.Category -in @('AccountManagement', 'GroupMembership', 'ScheduledTasks', 'SecurityConfiguration', 'ServiceInstallation', 'Defender')
+    } | Sort-Object @{ Expression = { if ($_.Timestamp) { [datetimeoffset]$_.Timestamp } else { [datetimeoffset]::MinValue } }; Descending = $true }, LogName, EventRecordId, EventId, QueryName)
+    $authentication = @($Report.Events | Where-Object { $_.Category -eq 'Authentication' })
+    $authQueries = @($Report.Queries | Where-Object { $_.Name -like 'Authentication *' })
     $lines = @(
         'Windows CCDC Security Event Triage v0.1'
         '========================================='
@@ -348,18 +354,51 @@ function Get-TriageSummary {
         ('Time window: ' + $Report.TimeWindow.Start + ' through ' + $Report.TimeWindow.End + ' (' + $Report.TimeWindow.Hours + ' hours)')
         ('Report saved: ' + $saved)
     )
+    if ($Detailed) {
+        $cappedQueries = @($Report.Queries | Where-Object { $_.Capped })
+        $capNames = if ($cappedQueries.Count -gt 0) { ($cappedQueries | ForEach-Object { $_.Name }) -join '; ' } else { 'none' }
+        $lines = @(
+            'REPORT HEADER'
+            ('Get-SecurityEventTriage.ps1 v' + (Format-Value $Report.Version))
+            ('Hostname: ' + (Format-Value $Report.Hostname) + '; collected: ' + (Format-Value $Report.CollectedAt))
+            ('Mode: ' + $Report.Mode)
+            ('Requested window: ' + $Report.TimeWindow.Start + ' through ' + $Report.TimeWindow.End + ' (' + $Report.TimeWindow.Hours + ' hours)')
+            ('Report saved: ' + $saved)
+            ('Output directory: ' + (Format-Value $Report.OutputDirectory))
+            ''
+            'AT A GLANCE'
+            ('Retained events: ' + @($Report.Events).Count + '; security-change events: ' + $securityChanges.Count + '; authentication events: ' + $authentication.Count)
+            ('Query overview: ' + ((@($Report.Queries | Group-Object Status | Sort-Object Name | ForEach-Object { $_.Name + '=' + $_.Count })) -join '; '))
+            ('Capped queries: ' + $cappedQueries.Count + ' (' + $capNames + ')')
+            ('Collection issues: ' + $CollectionIssues.Count)
+            ('Output directory: ' + (Format-Value $Report.OutputDirectory))
+            'Counts are observed/retained records, not total activity; unavailable queries are not successful empty results.'
+        )
+    }
 
-    $lines += ''
-    $lines += 'Collection status:'
+    $queryLines = @()
     foreach ($query in @($Report.Queries)) {
         $capText = if ($query.Capped) { '; capped at ' + $query.ReportingLimit } else { '' }
-        $lines += ('- ' + $query.Name + ' [' + $query.LogName + ']: ' + $query.Status + '; observed ' + $query.ObservedCount + $capText)
+        $observed = if ($query.Status -eq 'Unavailable') { '<unavailable>' } else { [string]$query.ObservedCount }
+        $queryLines += ('- ' + $query.Name + ' [' + $query.LogName + ']: ' + $query.Status + '; observed ' + $observed + $capText)
+        if ($Detailed) {
+            $queryLines += ('  Event IDs: ' + ($query.EventIds -join ', ') + '; reporting limit: ' + $query.ReportingLimit + '; query limit: ' + $query.QueryLimit + '; capped: ' + $query.Capped)
+            if ($query.Error) { $queryLines += '  Error: ' + $query.Error }
+            if ($query.Status -eq 'Partial' -and -not $query.Capped) {
+                $queryLines += '  Event parsing limitations; see collection issues and ParseError in structured reports.'
+            }
+        }
+    }
+    if (-not $Detailed) {
+        $lines += ''
+        $lines += 'Collection status:'
+        $lines += $queryLines
     }
 
     $lines += ''
     $lines += 'Observed counts by security category:'
     if (@($Report.Events).Count -eq 0) {
-        $lines += '- none observed in the selected window'
+        $lines += '- no records retained; see query statuses and logging limitations'
     }
     else {
         foreach ($group in @($Report.Events | Group-Object Category | Sort-Object Name)) {
@@ -368,23 +407,74 @@ function Get-TriageSummary {
     }
 
     $lines += ''
-    $lines += 'Authentication summaries:'
-    foreach ($query in @($Report.Queries | Where-Object { $_.Name -like 'Authentication *' })) {
-        $capText = if ($query.Capped) { ' (bounded/capped)' } else { '' }
-        $lines += ('- ' + ($query.EventIds -join ',') + ': ' + $query.Status + '; observed ' + $query.ObservedCount + $capText)
+    $lines += $(if ($Detailed) { 'SECURITY EVENTS TO REVIEW' } else { 'High-signal security-change events (first 10):' })
+    $lines += ('Collected security-change events: ' + $securityChanges.Count)
+    if ($Detailed) { $lines += 'Collected events for investigation; they do not establish malicious activity.' }
+    $displayEvents = if ($Detailed) { $securityChanges } else { @($Report.ReviewPreview) }
+    if ($securityChanges.Count -eq 0) {
+        $lines += '- none retained; unavailable/capped queries and logging coverage limit conclusions'
+    }
+    else {
+        $firstEvent = $true
+        foreach ($event in $displayEvents) {
+            if ($Detailed -and -not $firstEvent) { $lines += '' }
+            $firstEvent = $false
+            $lines += ('- [' + $event.Timestamp + '] ' + $event.Description + ' (' + $event.EventId + ')')
+            if ($Detailed) {
+                foreach ($field in @('Category', 'Channel', 'Actor', 'Target', 'GroupName', 'ServiceName', 'ExecutablePath', 'ProcessName', 'CommandLine', 'SourceIpAddress', 'FailureCode', 'EventRecordId')) {
+                    if (-not [string]::IsNullOrWhiteSpace([string]$event.$field)) {
+                        $lines += ('  ' + $field + ': ' + [string]$event.$field)
+                    }
+                }
+            }
+            else {
+                $lines += ('  Actor: ' + (Format-Value $event.Actor) + '; Target: ' + (Format-Value $event.Target) + '; Source: ' + (Format-Value $event.SourceIpAddress))
+                $action = if ($event.CommandLine) { $event.CommandLine } else { $event.ExecutablePath }
+                $lines += ('  Action/details: ' + (Format-Value $action))
+                if ($event.ServiceName) { $lines += '  Service: ' + $event.ServiceName }
+            }
+        }
     }
 
     $lines += ''
-    $lines += 'High-signal security-change events (first 10):'
-    if (@($Report.ReviewPreview).Count -eq 0) {
-        $lines += '- none observed'
-    }
-    else {
-        foreach ($event in @($Report.ReviewPreview)) {
-            $lines += ('- [' + $event.Timestamp + '] ' + $event.Description + ' (' + $event.EventId + ')')
-            $lines += ('  Actor: ' + (Format-Value $event.Actor) + '; Target: ' + (Format-Value $event.Target) + '; Source: ' + (Format-Value $event.SourceIpAddress))
-            $lines += ('  Action/details: ' + (Format-Value $event.CommandLine))
+    $lines += $(if ($Detailed) { 'AUTHENTICATION SUMMARY' } else { 'Authentication summaries:' })
+    foreach ($query in $authQueries) {
+        $capText = if ($query.Capped) { ' (bounded/capped sample)' } else { '' }
+        $observed = if ($query.Status -eq 'Unavailable') { '<unavailable>' } else { [string]$query.ObservedCount }
+        foreach ($eventId in $query.EventIds) {
+            $description = (Get-EventDefinition $eventId).Description
+            $lines += ('- ' + $eventId + ' ' + $description + ': ' + $query.Status + '; observed ' + $observed + $capText)
         }
+    }
+    if ($Detailed) {
+        $lines += 'Breakdowns use retained authentication records only; queries may be empty, unavailable, partial, or capped.'
+        if (@($authQueries | Where-Object { $_.Capped }).Count -gt 0) {
+            $lines += 'BOUNDED SAMPLE: capped authentication queries do not represent total environmental activity.'
+        }
+        $breakdowns = [ordered]@{ 'Actor accounts' = 'Actor'; 'Target accounts' = 'Target'; 'Source IPs' = 'SourceIpAddress' }
+        foreach ($label in $breakdowns.Keys) {
+            $field = $breakdowns[$label]
+            $lines += ''
+            $lines += $label + ' (grouped separately by event ID):'
+            if ($authentication.Count -eq 0) {
+                $lines += 'No retained authentication data; see query coverage. Identities and sources cannot be established.'
+                continue
+            }
+            $identified = @($authentication | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.$field) })
+            $groups = @($identified | Group-Object EventId, $field | Sort-Object @{ Expression = 'Count'; Descending = $true }, Name)
+            $preview = @($groups | Select-Object -First 20)
+            $lines += ('Displayed groups: ' + $preview.Count + '/' + $groups.Count + '; retained events missing this field: ' + ($authentication.Count - $identified.Count))
+            if ($identified.Count -eq 0) { $lines += 'No populated values for this field in retained authentication records.' }
+            foreach ($group in $preview) {
+                $lines += ('- Event ' + $group.Group[0].EventId + '; ' + [string]$group.Group[0].$field + '; observed: ' + $group.Count)
+            }
+            if ($groups.Count -gt $preview.Count) { $lines += 'Additional groups omitted from TXT; all retained events remain in events.csv and events.json.' }
+        }
+        $lines += 'Actor, target, and source breakdowns can include the same event; their counts must not be added together.'
+        $lines += ''
+        $lines += 'COLLECTION STATUS AND LOGGING COVERAGE'
+        $lines += $queryLines
+        $lines += 'Success: records retained; Empty: no matching records; Partial: capped results or parsing limitations; Unavailable: collection failed.'
     }
 
     $lines += ''
@@ -393,6 +483,12 @@ function Get-TriageSummary {
         $lines += ('- ' + $log.LogName + ': ' + $log.Status + '; enabled=' + (Format-Value $log.IsEnabled) + '; records=' + (Format-Value $log.RecordCount))
     }
     $lines += '- Event absence does not prove that no relevant activity occurred; audit policy coverage is not changed by this script.'
+    if ($Detailed) {
+        $lines += '- Enabled channels do not guarantee appropriate audit-policy coverage; no matching events does not rule out suspicious activity.'
+        $lines += '- Capped queries retain bounded results only. Unavailable collection is not equivalent to zero events.'
+        $lines += '- Quick and Deep modes inspect different event sets; Deep adds process creation, additional authentication IDs, and PowerShell script blocks.'
+        $lines += '- This report summarizes authentication; retained process-creation and PowerShell records remain in events.json and events.csv.'
+    }
 
     if ($CollectionIssues.Count -gt 0) {
         $lines += ''
@@ -410,6 +506,13 @@ function Get-TriageSummary {
     }
     $lines += ''
     $lines += ('Output directory: ' + (Format-Value $Report.OutputDirectory))
+    if ($Detailed) {
+        $lines += ''
+        $lines += 'REPORT FILE REFERENCES'
+        $lines += 'summary.txt: all retained high-signal security changes, authentication summaries, and collection/logging coverage.'
+        $lines += 'events.json: complete retained structured events, EventData, rendered Message, query metadata, and logging status.'
+        $lines += 'events.csv: all retained event rows and extracted fields, including EventData and rendered Message.'
+    }
     return ($lines -join [Environment]::NewLine)
 }
 
@@ -481,15 +584,10 @@ foreach ($query in $queries) {
 
 $logStatus = Get-LogStatus @($queries | ForEach-Object { $_.LogName })
 $highSignalCategories = @('AccountManagement', 'GroupMembership', 'ScheduledTasks', 'SecurityConfiguration', 'ServiceInstallation', 'Defender')
-$reviewPreview = @()
-foreach ($category in $highSignalCategories) {
-    $reviewPreview += @(
-        $allEvents |
-            Where-Object { $_.Category -eq $category } |
-            Sort-Object Timestamp -Descending
-    )
-}
-$reviewPreview = @($reviewPreview | Select-Object -First 10)
+$reviewPreview = @($allEvents |
+    Where-Object { $_.Category -in $highSignalCategories } |
+    Sort-Object @{ Expression = { if ($_.Timestamp) { [datetimeoffset]$_.Timestamp } else { [datetimeoffset]::MinValue } }; Descending = $true }, LogName, EventRecordId, EventId, QueryName |
+    Select-Object -First 10)
 
 $csvRows = @()
 foreach ($event in $allEvents) {
@@ -580,12 +678,12 @@ $report = [ordered]@{
     ReportSaved = $false
 }
 
-$summaryText = Get-TriageSummary $report $CollectionIssues $OutputIssues
+$summaryText = Get-TriageSummary $report $CollectionIssues $OutputIssues -Detailed
 $jsonText = $report | ConvertTo-Json -Depth 10
 if ($outputDirectory) {
     try {
         $report.ReportSaved = $true
-        $summaryText = Get-TriageSummary $report $CollectionIssues $OutputIssues
+        $summaryText = Get-TriageSummary $report $CollectionIssues $OutputIssues -Detailed
         $jsonText = $report | ConvertTo-Json -Depth 10
         Write-TriageReports $outputDirectory $summaryText $jsonText $csvRows
         $outputSaved = $true
@@ -604,7 +702,7 @@ if (-not $outputDirectory) {
         $report.OutputDirectory = $outputDirectory
         $report.OutputIssues = @($OutputIssues)
         $report.ReportSaved = $true
-        $summaryText = Get-TriageSummary $report $CollectionIssues $OutputIssues
+        $summaryText = Get-TriageSummary $report $CollectionIssues $OutputIssues -Detailed
         $jsonText = $report | ConvertTo-Json -Depth 10
         Write-TriageReports $outputDirectory $summaryText $jsonText $csvRows
         $outputSaved = $true
