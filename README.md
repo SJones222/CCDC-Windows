@@ -11,6 +11,51 @@ Remediation/  Explicitly requested remediation scripts
 Tests/        Tests for implemented behavior
 ```
 
+## Quick Install
+
+Use Windows PowerShell 5.1. The default installation destination is `C:\CCDC`. Git and third-party modules are not required. The command below downloads and executes `Install-CCDC.ps1` from `main`, which then downloads the complete repository ZIP over HTTPS. Review and trust the repository code before running it. The repository and selected branch must be accessible without authentication; this installer does not handle credentials.
+
+Production bootstrap (available after the installer is merged into `main`):
+
+```powershell
+& { $ccdcTls = [Net.ServicePointManager]::SecurityProtocol; try { [Net.ServicePointManager]::SecurityProtocol = $ccdcTls -bor [Net.SecurityProtocolType]::Tls12; & ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing -Uri 'https://raw.githubusercontent.com/SJones222/CCDC-Windows/main/Install-CCDC.ps1' -ErrorAction Stop).Content)) } finally { [Net.ServicePointManager]::SecurityProtocol = $ccdcTls } }
+```
+
+Administrator permissions may be necessary to write to `C:\CCDC`. The installer does not elevate, change execution policy, or execute any audit or remediation scripts. It temporarily enables TLS 1.2 for downloads and restores the process's previous protocol setting afterward.
+
+Existing destinations are intentionally refused, even if they contain only `Output/`. Files, local modifications, and previous reports are never overwritten or merged. Use a new destination for another installation. The destination must be an absolute local Windows path with an existing parent directory; PowerShell wildcard characters are not supported in the path.
+
+After installation, run scripts individually when ready:
+
+```powershell
+cd C:\CCDC
+.\Inventory\Get-SystemInventory.ps1
+.\Inventory\Get-NetworkInventory.ps1
+.\Audit\Get-UserAudit.ps1
+.\Audit\Get-PersistenceAudit.ps1
+.\Audit\Get-SecurityEventTriage.ps1
+```
+
+See [Current scripts](#current-scripts) for parameters and report filenames, and [COMMAND-CHEATSHEET.md](COMMAND-CHEATSHEET.md) for further execution examples.
+
+### Testing the installer
+
+To use an installer already saved locally with a clean test destination:
+
+```powershell
+.\Install-CCDC.ps1 -Destination 'C:\CCDC-InstallTest'
+```
+
+To test before merging, first publish the reviewed `deployment-test` branch, then run this one-line bootstrap. Both the installer and ZIP come from that branch; the production default remains `main`.
+
+```powershell
+& { $ccdcTls = [Net.ServicePointManager]::SecurityProtocol; try { [Net.ServicePointManager]::SecurityProtocol = $ccdcTls -bor [Net.SecurityProtocolType]::Tls12; & ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing -Uri 'https://raw.githubusercontent.com/SJones222/CCDC-Windows/deployment-test/Install-CCDC.ps1' -ErrorAction Stop).Content)) -Ref 'deployment-test' -Destination 'C:\CCDC-InstallTest' } finally { [Net.ServicePointManager]::SecurityProtocol = $ccdcTls } }
+```
+
+`-Ref` selects a repository branch. Installation validates the five scripts, README, contribution rules, and installer before copying the complete snapshot, including hidden tracked files. Empty `Remediation/` and `Tests/` directories and `Output/` are created if absent. The prepared installation is renamed into place only after all preparation succeeds. Failures before promotion leave a new destination absent; preexisting destinations are left untouched. Cleanup targets only staging directories created by that invocation. A forced process termination may leave temporary staging directories, but does not expose a partly copied destination.
+
+On NOVA, verify a clean test installation, the directory layout, script/documentation contents, cleanup, and the displayed execution examples. Re-run against an existing test directory containing an `Output/` sentinel file and confirm refusal without changes. Also test invalid refs, unavailable downloads, and denied destination permissions. Do not use an existing investigation directory for installation testing.
+
 ## Current scripts
 
 All scripts are standalone, read-only collectors intended for Windows PowerShell 5.1. They use built-in Windows commands, modules, and .NET APIs only.
