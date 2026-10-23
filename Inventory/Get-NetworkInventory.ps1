@@ -249,7 +249,15 @@ function Get-NetworkSummary {
         }
     }
 
+    $firewallLines = @('', $(if ($Detailed) { 'WINDOWS FIREWALL' } else { 'Firewall profiles:' }))
+    foreach ($profile in $Inventory.FirewallProfiles.Items) {
+        $firewallLines += ('- ' + $profile.ProfileName + ': ' + $profile.Status +
+            '; enabled=' + (Format-Value $profile.Enabled) +
+            '; inbound=' + (Format-Value $profile.DefaultInboundAction) +
+            '; outbound=' + (Format-Value $profile.DefaultOutboundAction))
+    }
     if ($Detailed) {
+        $lines += $firewallLines
         $lines += ''
         $lines += 'LISTENING TCP PORTS'
         $lines += ('Total: ' + (Format-ResultCount $Inventory.Listeners.TCP) + '; status: ' + $Inventory.Listeners.TCP.Status)
@@ -278,9 +286,9 @@ function Get-NetworkSummary {
                 @{ Label = 'PORT'; Expression = { Format-Value $_.LocalPort }; Width = 5 }
                 @{ Label = 'ADDRESS'; Expression = { Format-Value $_.LocalAddress }; Width = 39 }
                 @{ Label = 'PID'; Expression = { Format-Value $_.ProcessId }; Width = 8 }
-                @{ Label = 'PROCESS'; Expression = { Format-Value $_.ProcessName }; Width = 18 }
+                @{ Label = 'PROCESS'; Expression = { Format-Value $_.ProcessName }; Width = 40 }
                 @{ Label = 'ASSOCIATED SERVICES'; Expression = { Format-TextList $_.AssociatedServiceNames }; Width = 26 }
-            ) | Out-String -Width 110).TrimEnd()
+            ) | Out-String -Width 128).TrimEnd()
         }
         else {
             $lines += 'TCP listener preview (first 20 by port, then address; PID associations are not proof of ownership):'
@@ -363,13 +371,8 @@ function Get-NetworkSummary {
         }
     }
 
-    $lines += ''
-    $lines += $(if ($Detailed) { 'WINDOWS FIREWALL' } else { 'Firewall profiles:' })
-    foreach ($profile in $Inventory.FirewallProfiles.Items) {
-        $lines += ('- ' + $profile.ProfileName + ': ' + $profile.Status +
-            '; enabled=' + (Format-Value $profile.Enabled) +
-            '; inbound=' + (Format-Value $profile.DefaultInboundAction) +
-            '; outbound=' + (Format-Value $profile.DefaultOutboundAction))
+    if (-not $Detailed) {
+        $lines += $firewallLines
     }
     if ($Detailed) {
         $lines += ''
