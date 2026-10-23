@@ -23,7 +23,7 @@ function Add-OutputIssue {
 
 function New-UniqueOutputDirectory {
     param([string]$Root, [string]$HostFolder)
-    $stamp = Get-Date -Format 'yyyyMMdd-HHmmssfff'
+    $stamp = 'SystemInventory_' + (Get-Date -Format 'yyyyMMdd-HHmmssfff')
     $hostRoot = Join-Path $Root $HostFolder
     $candidate = Join-Path $hostRoot $stamp
     $suffix = 1
@@ -67,7 +67,7 @@ function Write-InventoryFiles {
 }
 
 function Get-InventorySummary {
-    param($Inventory, [array]$CollectionIssues, [array]$OutputIssues)
+    param($Inventory, [array]$CollectionIssues, [array]$OutputIssues, [switch]$Detailed)
     if ($null -eq $Inventory.IsAdministrator) {
         $admin = '<unavailable>'
     }
@@ -107,6 +107,35 @@ function Get-InventorySummary {
         ('Administrator privileges: ' + $admin)
         ('Report saved: ' + $reportSaved)
     )
+    if ($Detailed) {
+        $lines = @(
+            ('Get-SystemInventory.ps1 v' + (Format-InventoryValue $Inventory.Version))
+            ('Hostname: ' + (Format-InventoryValue $Inventory.Hostname))
+            ('Collected: ' + (Format-InventoryValue $Inventory.CollectedAt))
+            ('Report saved: ' + $reportSaved)
+            ('Output directory: ' + (Format-InventoryValue $Inventory.OutputDirectory))
+            ''
+            'AT A GLANCE'
+            ('Operating system: ' + (Format-InventoryValue $Inventory.OperatingSystemName))
+            ('Domain joined: ' + $domainJoined)
+            ('Domain/workgroup: ' + (Format-InventoryValue $Inventory.DomainOrWorkgroup))
+            ('Machine domain role: ' + (Format-InventoryValue $Inventory.MachineDomainRole))
+            ('Administrator privileges: ' + $admin)
+            ''
+            'SYSTEM DETAILS'
+            ('OS version: ' + (Format-InventoryValue $Inventory.OSVersion))
+            ('OS build: ' + (Format-InventoryValue $Inventory.OSBuildNumber))
+            ('OS architecture: ' + (Format-InventoryValue $Inventory.OSArchitecture))
+            ('Domain role value: ' + (Format-InventoryValue $Inventory.DomainRoleValue))
+            ('Current username: ' + (Format-InventoryValue $Inventory.CurrentUsername))
+            ''
+            'COLLECTION NOTES AND LIMITATIONS'
+            'Values shown as <unavailable> were missing or could not be collected; they are not confirmed empty results.'
+        )
+        if ($CollectionIssues.Count -eq 0) {
+            $lines += 'No collection issues reported.'
+        }
+    }
     if ($CollectionIssues.Count -gt 0) {
         $lines += ''
         $lines += 'Collection issues:'
@@ -118,7 +147,14 @@ function Get-InventorySummary {
         foreach ($issue in $OutputIssues) { $lines += '- ' + $issue }
     }
     $lines += ''
-    $lines += ('Output directory: ' + (Format-InventoryValue $Inventory.OutputDirectory))
+    if ($Detailed) {
+        $lines += 'REPORT FILE REFERENCES'
+        $lines += 'summary.txt: complete human-readable system report.'
+        $lines += 'inventory.json: structured system information, collection/output issues, and report metadata.'
+    }
+    else {
+        $lines += ('Output directory: ' + (Format-InventoryValue $Inventory.OutputDirectory))
+    }
     $lines -join [Environment]::NewLine
 }
 
@@ -298,13 +334,13 @@ $inventory = [ordered]@{
     OutputDirectory = $outputDirectory
     ReportSaved = $false
 }
-$summaryText = Get-InventorySummary $inventory $CollectionIssues $OutputIssues
+$summaryText = Get-InventorySummary $inventory $CollectionIssues $OutputIssues -Detailed
 $jsonText = $inventory | ConvertTo-Json -Depth 5
 
 if ($outputDirectory) {
     try {
         $inventory.ReportSaved = $true
-        $summaryText = Get-InventorySummary $inventory $CollectionIssues $OutputIssues
+        $summaryText = Get-InventorySummary $inventory $CollectionIssues $OutputIssues -Detailed
         $jsonText = $inventory | ConvertTo-Json -Depth 5
         Write-InventoryFiles $outputDirectory $summaryText $jsonText
         $outputSaved = $true
@@ -323,7 +359,7 @@ if (-not $outputDirectory) {
         $inventory.OutputDirectory = $outputDirectory
         $inventory.OutputIssues = @($OutputIssues)
         $inventory.ReportSaved = $true
-        $summaryText = Get-InventorySummary $inventory $CollectionIssues $OutputIssues
+        $summaryText = Get-InventorySummary $inventory $CollectionIssues $OutputIssues -Detailed
         $jsonText = $inventory | ConvertTo-Json -Depth 5
         Write-InventoryFiles $outputDirectory $summaryText $jsonText
         $outputSaved = $true
