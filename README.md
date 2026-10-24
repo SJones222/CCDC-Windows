@@ -18,7 +18,7 @@ Tests/        Tests for implemented behavior
 
 Use Windows PowerShell 5.1. The default installation destination is `C:\CCDC`. Git and third-party modules are not required. The command below downloads and executes `Install-CCDC.ps1` from `main`, which then downloads the complete repository ZIP over HTTPS. Review and trust the repository code before running it. The repository and selected branch must be accessible without authentication; this installer does not handle credentials.
 
-Production bootstrap (installs `main`, which already includes the teammate-script integration; the barebones v3.0 firewall replacement will be available on `main` only after `firewall-version-fix` is merged):
+Production bootstrap (installs `main`, including the teammate-script integration and the approved barebones v3.0 firewall script):
 
 ```powershell
 & { $ccdcTls = [Net.ServicePointManager]::SecurityProtocol; try { [Net.ServicePointManager]::SecurityProtocol = $ccdcTls -bor [Net.SecurityProtocolType]::Tls12; & ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing -Uri 'https://raw.githubusercontent.com/SJones222/CCDC-Windows/main/Install-CCDC.ps1' -ErrorAction Stop).Content)) } finally { [Net.ServicePointManager]::SecurityProtocol = $ccdcTls } }
@@ -54,7 +54,7 @@ To use an installer already saved locally with a clean test destination:
 .\Install-CCDC.ps1 -Ref 'firewall-version-fix' -Destination 'C:\CCDC-FirewallTest'
 ```
 
-To test the firewall replacement before merging, run this one-line bootstrap into a new directory. Both the installer and ZIP come from the published `firewall-version-fix` branch; the production default remains `main`.
+To test the firewall replacement from its testing branch, run this one-line bootstrap into a new directory. Both the installer and ZIP come from the published `firewall-version-fix` branch; the production default remains `main`.
 
 ```powershell
 & { $ccdcTls = [Net.ServicePointManager]::SecurityProtocol; try { [Net.ServicePointManager]::SecurityProtocol = $ccdcTls -bor [Net.SecurityProtocolType]::Tls12; & ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing -Uri 'https://raw.githubusercontent.com/SJones222/CCDC-Windows/firewall-version-fix/Install-CCDC.ps1' -ErrorAction Stop).Content)) -Ref 'firewall-version-fix' -Destination 'C:\CCDC-FirewallTest' } finally { [Net.ServicePointManager]::SecurityProtocol = $ccdcTls } }
