@@ -54,7 +54,7 @@ The script creates the host and timestamped subdirectories below the selected ro
 
 ## Windows Team Scripts (manual operation)
 
-The installer deploys all five files below to the installation root and preserves their source directories. None is run automatically. Start an elevated Windows PowerShell 5.1 session and use `cd C:\CCDC` (or the chosen installation root). See the [README team section](README.md#windows-team-scripts) for contributor attribution, complete prerequisites, operational limits, verified hashes, and unresolved redistribution permissions.
+The installer deploys all five files below to the installation root and preserves their source directories. None is run automatically. Start an elevated Windows PowerShell 5.1 session and use `cd C:\CCDC` (or the chosen installation root). See the [README team section](README.md#windows-team-scripts) for contributor attribution, complete prerequisites, operational limits, verified hashes, and the scope of maintainer-confirmed redistribution permission.
 
 ### Domain-controller firewall
 

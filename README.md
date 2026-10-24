@@ -170,7 +170,7 @@ The following approved SHA256 values were verified before import. Files retain t
 | `Passwords/restore_passwords.ps1` | `17f815732156f00421e97a221b4036af20f89b091ddd263a83ebf08b13c9df8b` |
 | `SSH/WIN_SSH.ps1` | `b8e40eced52cf6087dd1a59aabeaff7e2c4f7139e65871f0d6027a43a1397e9d` |
 
-No GitHub-recognized license was reported for any of the three upstream repositories during integration, and no license grant appears in these script headers. Contributor redistribution permission/license terms remain unresolved and should be confirmed before publishing the imported files. Attribution and hash matching do not resolve that outstanding issue.
+The CCDC-Windows maintainer has explicitly confirmed that contributors from Enhan540/CCDCTesting, Tausetii/CCDC-tings, and nosodium/yesodium authorized inclusion and redistribution of their scripts in CCDC-Windows for the team's CCDC practice. This permission resolves the integration's contributor-permission requirement; it does not imply that the upstream repositories have adopted a general open-source license. No GitHub-recognized license was reported during integration, and no license grant appears in these script headers.
 
 ## Network Inventory v0.1 baseline
 
