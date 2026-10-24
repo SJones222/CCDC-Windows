@@ -58,19 +58,31 @@ The installer deploys all five files below to the installation root and preserve
 
 ### Domain-controller firewall
 
-From [Enhan540/CCDCTesting](https://github.com/Enhan540/CCDCTesting). Required: `-ClientNetworks` containing the actual approved IP/CIDR scope; built-in NetSecurity commands and administrator privileges. The script is intended for DCs but does not check the host role.
+From [Enhan540/CCDCTesting](https://github.com/Enhan540/CCDCTesting), [original barebones v3.0 source](https://github.com/Enhan540/CCDCTesting/blob/main/scripts/current/dc-firewalls-barebones/dc-firewalls-barebones-v3.0.ps1). Preserved source: `Firewall/dc-firewalls-barebones-v3.0.ps1`; approved SHA256: `9b373c5811eb7215ba2b767c172c762828cab0d548d1da4471b3c28b953b16ef`. Requires Windows PowerShell 5.1, administrator privileges, and built-in NetSecurity functionality; it can elevate through UAC. Intended for Active Directory DCs, without a host-role check.
+
+**These commands apply changes immediately; there is no `-Preview` parameter or `-WhatIf` implementation.** Choose the intended operation, not all three in sequence. `-ClientNetworks` is optional for initial setup; without it, the primary IPv4 subnet is detected. Replace the illustrative `192.168.1.0/24` with the actual authorized network.
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ad-default-firewalls-v11.3.ps1 -ClientNetworks '10.20.0.0/16' -Preview
+cd C:\CCDC
+# Initial setup using the detected subnet:
+.\dc-firewalls-barebones-v3.0.ps1
+# Alternative initial setup with an explicit network:
+.\dc-firewalls-barebones-v3.0.ps1 -ClientNetworks '192.168.1.0/24'
+# Modify existing enabled local barebones rule scopes (explicit network required):
+.\dc-firewalls-barebones-v3.0.ps1 -Modify -ClientNetworks '192.168.1.0/24'
 ```
 
-For multiple networks, invoke the same unmodified script with a PowerShell array:
+Equivalent `powershell.exe` forms, also alternatives:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "& '.\ad-default-firewalls-v11.3.ps1' -ClientNetworks @('10.20.0.0/16','10.30.0.0/16') -Preview"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\dc-firewalls-barebones-v3.0.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\dc-firewalls-barebones-v3.0.ps1 -ClientNetworks '192.168.1.0/24'
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\dc-firewalls-barebones-v3.0.ps1 -Modify -ClientNetworks '192.168.1.0/24'
 ```
 
-Omitting `-Preview` applies changes. `-IncludeADWS`, `-IncludeWinRM`, `-IncludeWinRMHTTPS`, and `-IncludeRDP` require `-ManagementHosts`. Optional cleanup (`-DisableNonScriptInboundAllowRules` plus `-ConfirmCleanup` when applying) can disable other local inbound Allow rules, including SSH; retain console access. Applying runs save `.wfw` and enabled-rule `.txt` backups under `C:\ProgramData\CCDC\FirewallBackups` unless `-BackupDirectory` overrides it. Preview does not write those backups. Verify effective policy and AD connectivity afterward.
+Initial setup creates/verifies 13 inbound AD Allow rules and enables Domain, Private, and Public firewall profiles. It **disables other enabled local inbound rules, including Allow and Block rules**. Retain console access: SSH, RDP, WinRM, additional scored services, and other AD services may lose access unless separately accommodated. Existing Group Policy rules can remain effective. It does not explicitly set `DefaultInboundAction` to Block. Verify effective policy and required connectivity afterward.
+
+Backups and reports are fixed at `C:\CCDC\FirewallBackups`, even with a custom installer destination. Initial setup writes BEFORE and AFTER policy backups and readable rule reports (`firewall-before-<timestamp>.wfw` / `.txt`, `firewall-after-<timestamp>.wfw` / `.txt`) and prints a `netsh advfirewall import` rollback command. `-Modify` changes only remote scopes on enabled local script-managed barebones inbound rules and exports an after-modification policy/change report (`firewall-modify-after-<timestamp>.wfw` / `.txt`); it does not create a separate before-modification backup. No firewall script runs during installation.
 
 ### AD password resets
 

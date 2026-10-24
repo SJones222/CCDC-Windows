@@ -90,7 +90,7 @@ These five approved files are imported byte-for-byte from the contributors below
 
 | Filename / preserved source | Purpose | Original contributor and repository |
 | --- | --- | --- |
-| [ad-default-firewalls-v11.3.ps1](Firewall/ad-default-firewalls-v11.3.ps1) | Scoped AD domain-controller firewall rules and policy backup | [Enhan540 / CCDCTesting](https://github.com/Enhan540/CCDCTesting), `scripts/current/ad-default-firewalls/ad-default-firewalls-v11.3.ps1` |
+| [dc-firewalls-barebones-v3.0.ps1](Firewall/dc-firewalls-barebones-v3.0.ps1) | Barebones scoped AD domain-controller firewall rules and policy backups | [Enhan540 / CCDCTesting](https://github.com/Enhan540/CCDCTesting), [original source](https://github.com/Enhan540/CCDCTesting/blob/main/scripts/current/dc-firewalls-barebones/dc-firewalls-barebones-v3.0.ps1) |
 | [pcr.ps1](Passwords/pcr.ps1) | Reset privileged/high-exposure AD user passwords | [Tausetii / CCDC-tings](https://github.com/Tausetii/CCDC-tings), `PCRs/pcr.ps1` |
 | [pcra.ps1](Passwords/pcra.ps1) | Reset AD administrator-account passwords | [Tausetii / CCDC-tings](https://github.com/Tausetii/CCDC-tings), `PCRs/pcra.ps1` |
 | [restore_passwords.ps1](Passwords/restore_passwords.ps1) | Set known baseline AD passwords from CSV input | [Tausetii / CCDC-tings](https://github.com/Tausetii/CCDC-tings), `PCRs/restore_passwords.ps1` |
@@ -98,22 +98,38 @@ These five approved files are imported byte-for-byte from the contributors below
 
 ### Domain-controller firewall
 
-`ad-default-firewalls-v11.3.ps1` requires `-ClientNetworks` with literal IP addresses or CIDR subnets. It is intended for domain controllers but does not validate the machine's domain role. Administrator privileges and the built-in NetSecurity commands are required; the script can relaunch itself through UAC. Replace the example network with the approved client scope.
+`dc-firewalls-barebones-v3.0.ps1` is intended for Active Directory domain controllers but does not validate the machine's domain role. It requires Windows PowerShell 5.1, administrator privileges, and built-in NetSecurity functionality; it can relaunch itself through UAC. **Running with no parameters applies changes immediately. There is no `-Preview` parameter or `-WhatIf` implementation.** Retain console access and review the intended network scope before running.
+
+Default initial application detects the primary IPv4 subnet:
 
 ```powershell
 cd C:\CCDC
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ad-default-firewalls-v11.3.ps1 -ClientNetworks '10.20.0.0/16' -Preview
+.\dc-firewalls-barebones-v3.0.ps1
 ```
 
-`-Preview` is the script's explicit preview switch; `-WhatIf` is also implemented. To apply, omit `-Preview` only after reviewing the intended changes. For multiple networks, use the same script through `-Command` so PowerShell constructs the array correctly:
+Alternatively, initial application with an explicit client network (replace this illustrative range with the actual authorized network):
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "& '.\ad-default-firewalls-v11.3.ps1' -ClientNetworks @('10.20.0.0/16','10.30.0.0/16') -Preview"
+.\dc-firewalls-barebones-v3.0.ps1 -ClientNetworks '192.168.1.0/24'
 ```
 
-Relevant options include `-PeerDCAddresses`, `-ManagementHosts`, and the original `-IncludeLDAPS`, `-IncludeGlobalCatalog`, `-IncludeSecureGlobalCatalog`, `-IncludeADWS`, `-IncludeLegacyNetBIOS`, `-IncludeICMP`, `-IncludeWinRM`, `-IncludeWinRMHTTPS`, `-IncludeRDP`, and `-ExcludeNTP` switches. Management-service switches require `-ManagementHosts`. The default `-BackupDirectory` is `C:\ProgramData\CCDC\FirewallBackups`; an applying run writes `firewall-<timestamp>-<tag>.wfw` and `enabled-rules-<timestamp>-<tag>.txt`. Preview does not write these backups.
+To change remote scopes on existing enabled local script-managed barebones inbound rules, use `-Modify`, which requires an explicit `-ClientNetworks` argument:
 
-`-DisableNonScriptInboundAllowRules` (aliases `-DisableOtherRules` / `-Cleanup`) can disable **all other enabled local inbound Allow rules**, including SSH rules. Applying cleanup also requires `-ConfirmCleanup`; it is not enabled by default. Retain console access. The script enables firewall profiles and sets inbound Block, and Group Policy can affect effective policy. It does not verify AD connectivity or every created rule after applying changes; test DNS, RPC, replication, Group Policy, and remote access. Rollback uses the saved `.wfw` policy, not automatic recovery.
+```powershell
+.\dc-firewalls-barebones-v3.0.ps1 -Modify -ClientNetworks '192.168.1.0/24'
+```
+
+Equivalent `powershell.exe` execution forms follow. Choose the intended operation; these are alternatives, not an installation sequence:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\dc-firewalls-barebones-v3.0.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\dc-firewalls-barebones-v3.0.ps1 -ClientNetworks '192.168.1.0/24'
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\dc-firewalls-barebones-v3.0.ps1 -Modify -ClientNetworks '192.168.1.0/24'
+```
+
+Initial setup creates and verifies 13 inbound AD Allow rules (reusing/updating matching managed rules on subsequent initial runs), enables Domain, Private, and Public firewall profiles, and **disables other enabled local inbound rules, including both Allow and Block rules**. SSH, RDP, WinRM, additional scored services, and other AD services may lose access unless separately accommodated. Group Policy firewall rules can remain effective. The script does not explicitly set `DefaultInboundAction` to Block. Test effective policy and required connectivity; installation never executes this script automatically.
+
+Backups and reports always go to `C:\CCDC\FirewallBackups`, regardless of a custom installer destination. Initial setup exports a BEFORE policy backup and readable rule report (`firewall-before-<timestamp>.wfw` / `.txt`) before applying changes, then an AFTER backup and report (`firewall-after-<timestamp>.wfw` / `.txt`). It prints a `netsh advfirewall import` rollback command; rollback is not automatic. `-Modify` exports the after-modification policy and change report (`firewall-modify-after-<timestamp>.wfw` / `.txt`) but does not create a separate before-modification backup.
 
 ### Password reset scripts
 
@@ -156,7 +172,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\WIN_SSH.ps1
 
 For builds 17763 and later it uses the Windows OpenSSH capability, with a DISM fallback that needs an available capability source. The legacy path downloads the x64 Win32-OpenSSH package from GitHub, installs under `$env:ProgramFiles\OpenSSH`, invokes that package's `install-sshd.ps1`, and changes its working directory. It does not require or execute `HardenTest.ps1`, `HardenTest2.ps1`, `MockDCPt1.ps1`, or `MockDCPt2.ps1`.
 
-It replaces the named `OpenSSH-Server (TCP-In)` rule and creates an inbound TCP 22 Allow rule for all profiles without a source-address restriction. It edits `$env:ProgramData\ssh\sshd_config` in place: matched directives enable password/keyboard-interactive authentication and disable public-key authentication. Missing or differently formatted directives are not inserted, so verify the effective configuration. Output is console progress, not `Output/` reports. Legacy setup may need GitHub connectivity; native capability installation may need Windows feature-source access. The separate firewall script's optional cleanup can disable this SSH rule.
+It replaces the named `OpenSSH-Server (TCP-In)` rule and creates an inbound TCP 22 Allow rule for all profiles without a source-address restriction. It edits `$env:ProgramData\ssh\sshd_config` in place: matched directives enable password/keyboard-interactive authentication and disable public-key authentication. Missing or differently formatted directives are not inserted, so verify the effective configuration. Output is console progress, not `Output/` reports. Legacy setup may need GitHub connectivity; native capability installation may need Windows feature-source access. The separate barebones firewall script's initial setup disables other enabled local inbound rules, including this SSH rule.
 
 ### Provenance and redistribution
 
@@ -164,7 +180,7 @@ The following approved SHA256 values were verified before import. Files retain t
 
 | Imported file | SHA256 |
 | --- | --- |
-| `Firewall/ad-default-firewalls-v11.3.ps1` | `5ed1fea3ea2dc891c1493a3b2d6632fd634354a90cef5a4691455991edac1ce1` |
+| `Firewall/dc-firewalls-barebones-v3.0.ps1` | `9b373c5811eb7215ba2b767c172c762828cab0d548d1da4471b3c28b953b16ef` |
 | `Passwords/pcr.ps1` | `09f6e600788419b10c734a32f5fcc17545d1b6ad347bc6c69807dda8159b93ac` |
 | `Passwords/pcra.ps1` | `b7536d3e2e59c6f786c0610494fc779a033fa69f7c37b0cd35c36fd9ad17ec57` |
 | `Passwords/restore_passwords.ps1` | `17f815732156f00421e97a221b4036af20f89b091ddd263a83ebf08b13c9df8b` |
