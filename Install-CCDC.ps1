@@ -34,6 +34,11 @@ $requiredFiles = @(
     'Audit\Get-UserAudit.ps1'
     'Audit\Get-PersistenceAudit.ps1'
     'Audit\Get-SecurityEventTriage.ps1'
+    'Firewall\ad-default-firewalls-v11.3.ps1'
+    'Passwords\pcr.ps1'
+    'Passwords\pcra.ps1'
+    'Passwords\restore_passwords.ps1'
+    'SSH\WIN_SSH.ps1'
     'README.md'
     'AGENTS.md'
     'Install-CCDC.ps1'
@@ -44,6 +49,11 @@ $rootCopies = [ordered]@{
     'users.ps1' = 'Audit\Get-UserAudit.ps1'
     'persistence.ps1' = 'Audit\Get-PersistenceAudit.ps1'
     'events.ps1' = 'Audit\Get-SecurityEventTriage.ps1'
+    'ad-default-firewalls-v11.3.ps1' = 'Firewall\ad-default-firewalls-v11.3.ps1'
+    'pcr.ps1' = 'Passwords\pcr.ps1'
+    'pcra.ps1' = 'Passwords\pcra.ps1'
+    'restore_passwords.ps1' = 'Passwords\restore_passwords.ps1'
+    'WIN_SSH.ps1' = 'SSH\WIN_SSH.ps1'
 }
 $temporaryDirectory = $null
 $pendingDirectory = $null

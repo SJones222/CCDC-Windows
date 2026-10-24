@@ -1,6 +1,6 @@
 # Windows CCDC PowerShell Toolkit
 
-A small, specification-driven toolkit for Windows CCDC inventory, auditing, and explicitly requested remediation tasks. Scripts target Windows PowerShell 5.1 and use only built-in Windows capabilities.
+A small, specification-driven Windows PowerShell 5.1 toolkit for Windows CCDC inventory, auditing, and explicitly requested administration tasks. The five read-only inventory/audit scripts use built-in Windows capabilities. Separately attributed team scripts retain their original behavior and prerequisites.
 
 ## Directory structure
 
@@ -8,6 +8,9 @@ A small, specification-driven toolkit for Windows CCDC inventory, auditing, and 
 Inventory/    Read-only system inventory scripts
 Audit/        Read-only security and configuration audit scripts
 Remediation/  Explicitly requested remediation scripts
+Firewall/     Teammate domain-controller firewall script
+Passwords/    Teammate Active Directory password reset/restore scripts
+SSH/          Teammate OpenSSH installation/configuration script
 Tests/        Tests for implemented behavior
 ```
 
@@ -15,7 +18,7 @@ Tests/        Tests for implemented behavior
 
 Use Windows PowerShell 5.1. The default installation destination is `C:\CCDC`. Git and third-party modules are not required. The command below downloads and executes `Install-CCDC.ps1` from `main`, which then downloads the complete repository ZIP over HTTPS. Review and trust the repository code before running it. The repository and selected branch must be accessible without authentication; this installer does not handle credentials.
 
-Production bootstrap (available after the installer is merged into `main`):
+Production bootstrap (installs `main`; the team additions become available after this integration is merged):
 
 ```powershell
 & { $ccdcTls = [Net.ServicePointManager]::SecurityProtocol; try { [Net.ServicePointManager]::SecurityProtocol = $ccdcTls -bor [Net.SecurityProtocolType]::Tls12; & ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing -Uri 'https://raw.githubusercontent.com/SJones222/CCDC-Windows/main/Install-CCDC.ps1' -ErrorAction Stop).Content)) } finally { [Net.ServicePointManager]::SecurityProtocol = $ccdcTls } }
@@ -39,6 +42,8 @@ cd C:\CCDC
 
 These files are complete copies of the original scripts, created only in the staged installation. The original scripts remain unchanged in `Inventory/` and `Audit/`. Both forms use the installation's `Output/<Hostname>/` hierarchy by default, preserve the existing report-folder prefixes and temporary-directory fallback, and accept the same parameters, including `-OutputDir`.
 
+The installer also deploys five [Windows Team Scripts](#windows-team-scripts) as root-level copies, for ten scripts total. Those five scripts change firewall, account, or SSH configuration when explicitly executed; their original output paths and prompts are preserved. None runs automatically during installation.
+
 See [Current scripts](#current-scripts) for parameters and report filenames, and [COMMAND-CHEATSHEET.md](COMMAND-CHEATSHEET.md) for further execution examples.
 
 ### Testing the installer
@@ -49,19 +54,19 @@ To use an installer already saved locally with a clean test destination:
 .\Install-CCDC.ps1 -Destination 'C:\CCDC-InstallTest'
 ```
 
-To test before merging, first publish the reviewed `deployment-test` branch, then run this one-line bootstrap. Both the installer and ZIP come from that branch; the production default remains `main`.
+To test this integration before merging, first publish the reviewed `team-integration-test` branch, then run this one-line bootstrap into a new directory. Both the installer and ZIP come from that branch; the production default remains `main`.
 
 ```powershell
-& { $ccdcTls = [Net.ServicePointManager]::SecurityProtocol; try { [Net.ServicePointManager]::SecurityProtocol = $ccdcTls -bor [Net.SecurityProtocolType]::Tls12; & ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing -Uri 'https://raw.githubusercontent.com/SJones222/CCDC-Windows/deployment-test/Install-CCDC.ps1' -ErrorAction Stop).Content)) -Ref 'deployment-test' -Destination 'C:\CCDC-InstallTest' } finally { [Net.ServicePointManager]::SecurityProtocol = $ccdcTls } }
+& { $ccdcTls = [Net.ServicePointManager]::SecurityProtocol; try { [Net.ServicePointManager]::SecurityProtocol = $ccdcTls -bor [Net.SecurityProtocolType]::Tls12; & ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing -Uri 'https://raw.githubusercontent.com/SJones222/CCDC-Windows/team-integration-test/Install-CCDC.ps1' -ErrorAction Stop).Content)) -Ref 'team-integration-test' -Destination 'C:\CCDC-TeamTest' } finally { [Net.ServicePointManager]::SecurityProtocol = $ccdcTls } }
 ```
 
-`-Ref` selects a repository branch. Installation validates the five scripts, README, contribution rules, and installer before copying the complete snapshot, including hidden tracked files. Empty `Remediation/` and `Tests/` directories and `Output/` are created if absent. The prepared installation is renamed into place only after all preparation succeeds. Failures before promotion leave a new destination absent; preexisting destinations are left untouched. Cleanup targets only staging directories created by that invocation. A forced process termination may leave temporary staging directories, but does not expose a partly copied destination.
+`-Ref` selects a repository branch. Installation validates all ten scripts, README, contribution rules, and installer before copying the complete snapshot, including hidden tracked files. Empty `Remediation/` and `Tests/` directories and `Output/` are created if absent. The prepared installation is renamed into place only after all preparation succeeds. Failures before promotion leave a new destination absent; preexisting destinations are left untouched. Cleanup targets only staging directories created by that invocation. A forced process termination may leave temporary staging directories, but does not expose a partly copied destination.
 
 On NOVA, verify a clean test installation, the directory layout, script/documentation contents, cleanup, and the displayed execution examples. Re-run against an existing test directory containing an `Output/` sentinel file and confirm refusal without changes. Also test invalid refs, unavailable downloads, and denied destination permissions. Do not use an existing investigation directory for installation testing.
 
 ## Current scripts
 
-All scripts are standalone, read-only collectors intended for Windows PowerShell 5.1. They use built-in Windows commands, modules, and .NET APIs only.
+The following five inventory/audit scripts are standalone, read-only collectors intended for Windows PowerShell 5.1. They use built-in Windows commands, modules, and .NET APIs only. The state-changing team scripts are documented separately below.
 
 The short filenames below are generated by the installer; they are not separate source files in a repository checkout.
 
@@ -78,6 +83,94 @@ The user audit uses the built-in ActiveDirectory module when available for domai
 Reports are written to a unique timestamped directory under `Output/<Hostname>/` when run from this repository. When a script is copied and run independently, its output is placed alongside the script under `Output/<Hostname>/`. `-OutputDir` overrides the output root. If the requested location cannot be used, scripts attempt a temporary-directory fallback and report the actual location.
 
 See [COMMAND-CHEATSHEET.md](COMMAND-CHEATSHEET.md) for executable examples.
+
+## Windows Team Scripts
+
+These five approved files are imported byte-for-byte from the contributors below. The installer preserves these source paths and creates identically named standalone copies in the installation root. Run them manually from an elevated Windows PowerShell 5.1 session after `cd C:\CCDC`; installation itself executes none of them. Their outputs do **not** follow the inventory/audit `Output/` convention.
+
+| Filename / preserved source | Purpose | Original contributor and repository |
+| --- | --- | --- |
+| [ad-default-firewalls-v11.3.ps1](Firewall/ad-default-firewalls-v11.3.ps1) | Scoped AD domain-controller firewall rules and policy backup | [Enhan540 / CCDCTesting](https://github.com/Enhan540/CCDCTesting), `scripts/current/ad-default-firewalls/ad-default-firewalls-v11.3.ps1` |
+| [pcr.ps1](Passwords/pcr.ps1) | Reset privileged/high-exposure AD user passwords | [Tausetii / CCDC-tings](https://github.com/Tausetii/CCDC-tings), `PCRs/pcr.ps1` |
+| [pcra.ps1](Passwords/pcra.ps1) | Reset AD administrator-account passwords | [Tausetii / CCDC-tings](https://github.com/Tausetii/CCDC-tings), `PCRs/pcra.ps1` |
+| [restore_passwords.ps1](Passwords/restore_passwords.ps1) | Set known baseline AD passwords from CSV input | [Tausetii / CCDC-tings](https://github.com/Tausetii/CCDC-tings), `PCRs/restore_passwords.ps1` |
+| [WIN_SSH.ps1](SSH/WIN_SSH.ps1) | Install/configure OpenSSH Server and its firewall rule | [nosodium / yesodium](https://github.com/nosodium/yesodium), `WIN_SSH.ps1` |
+
+### Domain-controller firewall
+
+`ad-default-firewalls-v11.3.ps1` requires `-ClientNetworks` with literal IP addresses or CIDR subnets. It is intended for domain controllers but does not validate the machine's domain role. Administrator privileges and the built-in NetSecurity commands are required; the script can relaunch itself through UAC. Replace the example network with the approved client scope.
+
+```powershell
+cd C:\CCDC
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ad-default-firewalls-v11.3.ps1 -ClientNetworks '10.20.0.0/16' -Preview
+```
+
+`-Preview` is the script's explicit preview switch; `-WhatIf` is also implemented. To apply, omit `-Preview` only after reviewing the intended changes. For multiple networks, use the same script through `-Command` so PowerShell constructs the array correctly:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "& '.\ad-default-firewalls-v11.3.ps1' -ClientNetworks @('10.20.0.0/16','10.30.0.0/16') -Preview"
+```
+
+Relevant options include `-PeerDCAddresses`, `-ManagementHosts`, and the original `-IncludeLDAPS`, `-IncludeGlobalCatalog`, `-IncludeSecureGlobalCatalog`, `-IncludeADWS`, `-IncludeLegacyNetBIOS`, `-IncludeICMP`, `-IncludeWinRM`, `-IncludeWinRMHTTPS`, `-IncludeRDP`, and `-ExcludeNTP` switches. Management-service switches require `-ManagementHosts`. The default `-BackupDirectory` is `C:\ProgramData\CCDC\FirewallBackups`; an applying run writes `firewall-<timestamp>-<tag>.wfw` and `enabled-rules-<timestamp>-<tag>.txt`. Preview does not write these backups.
+
+`-DisableNonScriptInboundAllowRules` (aliases `-DisableOtherRules` / `-Cleanup`) can disable **all other enabled local inbound Allow rules**, including SSH rules. Applying cleanup also requires `-ConfirmCleanup`; it is not enabled by default. Retain console access. The script enables firewall profiles and sets inbound Block, and Group Policy can affect effective policy. It does not verify AD connectivity or every created rule after applying changes; test DNS, RPC, replication, Group Policy, and remote access. Rollback uses the saved `.wfw` policy, not automatic recovery.
+
+### Password reset scripts
+
+`pcr.ps1` and `pcra.ps1` require the ActiveDirectory PowerShell module, domain connectivity, and rights to reset the targeted AD accounts. Neither has mandatory explicit parameters. Both accept `-ExcludeUsers`, `-OutFile`, `-IncludeSPNAccounts`, and `-ForceChangeAtLogon`; both implement `-WhatIf` and high-impact confirmation prompts.
+
+```powershell
+cd C:\CCDC
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\pcr.ps1 -WhatIf
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\pcra.ps1 -WhatIf
+```
+
+`pcr.ps1` selects users through its existing privileged/exposure group list and `AdminCount=1`; `pcra.ps1` selects administrator groups and the domain RID-500 Administrator. Both skip `krbtgt` by default, the executing username, disabled accounts, and SPN-bearing accounts unless `-IncludeSPNAccounts` is supplied. Group lookups use English names and can be skipped with warnings. These are AD-account operations, not local-account reset tools. Resetting service-account passwords can disrupt dependent services.
+
+Applying runs create **plaintext password records** at `C:\Secure\pwreset_<timestamp>.txt` (`pcr.ps1`) or `C:\Secure\admin_pwreset_<timestamp>.txt` (`pcra.ps1`) unless `-OutFile` overrides the path. Output lines are headerless `account, password` records, not the restore script's CSV schema. The scripts use embedded word lists for generated passphrases, modify the output directory's ACL with `icacls`, and initialize the selected output file with overwrite behavior. Choose a unique output path and protect these records; never commit them to this repository.
+
+### Restore known passwords
+
+`restore_passwords.ps1` also requires the ActiveDirectory module, domain access, and appropriate reset/unlock rights. It sets passwords to a **known baseline**; it cannot recover unknown previous passwords. Use either:
+
+- `-BaselineCsv <path>`: mandatory CSV columns `Username,Password`, containing each account and its known plaintext baseline password.
+- `-BaselinePassword <securestring>` with an optional `-ResetLog <path>`: the reset-log CSV must have a `Username` column. If `-ResetLog` is omitted, the script searches for the newest `C:\Secure\pwreset_*.csv`.
+
+```powershell
+cd C:\CCDC
+.\restore_passwords.ps1 -BaselineCsv 'C:\Secure\baseline.csv' -WhatIf
+$baseline = Read-Host 'Known baseline password' -AsSecureString
+.\restore_passwords.ps1 -ResetLog 'C:\Secure\reset-targets.csv' -BaselinePassword $baseline -WhatIf
+```
+
+The reset scripts' default `.txt` records are **not directly compatible** with either restore input. Renaming a TXT file to CSV does not supply the required header or validate its contents; prepare and review correctly formatted input separately. Restore supports `-WhatIf`, confirmation prompts, and `-ClearForceChange`; an applying run also attempts to unlock each account. It reports to the console and does not create a standard inventory report. It is intended for controlled baseline restoration, not automatic rollback of prior passwords.
+
+### Windows SSH
+
+`WIN_SSH.ps1` has no script parameters or `-WhatIf` mode. Run it only when SSH configuration changes are approved, with administrator privileges in Windows PowerShell 5.1. It installs/configures OpenSSH, starts and restarts `sshd`, and configures automatic startup:
+
+```powershell
+cd C:\CCDC
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\WIN_SSH.ps1
+```
+
+For builds 17763 and later it uses the Windows OpenSSH capability, with a DISM fallback that needs an available capability source. The legacy path downloads the x64 Win32-OpenSSH package from GitHub, installs under `$env:ProgramFiles\OpenSSH`, invokes that package's `install-sshd.ps1`, and changes its working directory. It does not require or execute `HardenTest.ps1`, `HardenTest2.ps1`, `MockDCPt1.ps1`, or `MockDCPt2.ps1`.
+
+It replaces the named `OpenSSH-Server (TCP-In)` rule and creates an inbound TCP 22 Allow rule for all profiles without a source-address restriction. It edits `$env:ProgramData\ssh\sshd_config` in place: matched directives enable password/keyboard-interactive authentication and disable public-key authentication. Missing or differently formatted directives are not inserted, so verify the effective configuration. Output is console progress, not `Output/` reports. Legacy setup may need GitHub connectivity; native capability installation may need Windows feature-source access. The separate firewall script's optional cleanup can disable this SSH rule.
+
+### Provenance and redistribution
+
+The following approved SHA256 values were verified before import. Files retain their exact upstream bytes, filenames, parameters, prompts, and output paths; upstream limitations were documented rather than patched.
+
+| Imported file | SHA256 |
+| --- | --- |
+| `Firewall/ad-default-firewalls-v11.3.ps1` | `5ed1fea3ea2dc891c1493a3b2d6632fd634354a90cef5a4691455991edac1ce1` |
+| `Passwords/pcr.ps1` | `09f6e600788419b10c734a32f5fcc17545d1b6ad347bc6c69807dda8159b93ac` |
+| `Passwords/pcra.ps1` | `b7536d3e2e59c6f786c0610494fc779a033fa69f7c37b0cd35c36fd9ad17ec57` |
+| `Passwords/restore_passwords.ps1` | `17f815732156f00421e97a221b4036af20f89b091ddd263a83ebf08b13c9df8b` |
+| `SSH/WIN_SSH.ps1` | `b8e40eced52cf6087dd1a59aabeaff7e2c4f7139e65871f0d6027a43a1397e9d` |
+
+No GitHub-recognized license was reported for any of the three upstream repositories during integration, and no license grant appears in these script headers. Contributor redistribution permission/license terms remain unresolved and should be confirmed before publishing the imported files. Attribution and hash matching do not resolve that outstanding issue.
 
 ## Network Inventory v0.1 baseline
 
