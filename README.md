@@ -90,46 +90,48 @@ These five approved files are imported byte-for-byte from the contributors below
 
 | Filename / preserved source | Purpose | Original contributor and repository |
 | --- | --- | --- |
-| [dc-firewalls-barebones-v3.0.ps1](Firewall/dc-firewalls-barebones-v3.0.ps1) | Barebones scoped AD domain-controller firewall rules and policy backups | [Enhan540 / CCDCTesting](https://github.com/Enhan540/CCDCTesting), [original source](https://github.com/Enhan540/CCDCTesting/blob/main/scripts/current/dc-firewalls-barebones/dc-firewalls-barebones-v3.0.ps1) |
+| [fireme-v2.0.ps1](Firewall/fireme-v2.0.ps1) | Firewall rules and policy backups | [Enhan540 / CCDCTesting](https://github.com/Enhan540/CCDCTesting), [original source](https://github.com/Enhan540/CCDCTesting/blob/main/fireme-v2.0.ps1) |
 | [pcr.ps1](Passwords/pcr.ps1) | Reset privileged/high-exposure AD user passwords | [Tausetii / CCDC-tings](https://github.com/Tausetii/CCDC-tings), `PCRs/pcr.ps1` |
 | [pcra.ps1](Passwords/pcra.ps1) | Reset AD administrator-account passwords | [Tausetii / CCDC-tings](https://github.com/Tausetii/CCDC-tings), `PCRs/pcra.ps1` |
 | [restore_passwords.ps1](Passwords/restore_passwords.ps1) | Set known baseline AD passwords from CSV input | [Tausetii / CCDC-tings](https://github.com/Tausetii/CCDC-tings), `PCRs/restore_passwords.ps1` |
 | [WIN_SSH.ps1](SSH/WIN_SSH.ps1) | Install/configure OpenSSH Server and its firewall rule | [nosodium / yesodium](https://github.com/nosodium/yesodium), `WIN_SSH.ps1` |
 
-### Domain-controller firewall
+### Active directory firewall script
 
-`dc-firewalls-barebones-v3.0.ps1` is intended for Active Directory domain controllers but does not validate the machine's domain role. It requires Windows PowerShell 5.1, administrator privileges, and built-in NetSecurity functionality; it can relaunch itself through UAC. **Running with no parameters applies changes immediately. There is no `-Preview` parameter or `-WhatIf` implementation.** Retain console access and review the intended network scope before running.
+`fireme-v2.0.ps1` supports Client and Domain Controller workflows in an Active Directory environment. It requires Windows PowerShell 5.1, Administrator privileges, and the built-in NetSecurity firewall cmdlets. Running it without a report-only or modify switch applies changes immediately; there is no `-Preview` or `-WhatIf` mode.
 
-Default initial application detects the primary IPv4 subnet:
+Retain console or out-of-band access before running it and review the intended network scope.
+
+Run an auto-detecting workflow:
 
 ```powershell
 cd C:\CCDC
-.\dc-firewalls-barebones-v3.0.ps1
+PowerShell.exe -NoProfile -ExecutionPolicy Bypass -File .\fireme-v2.0.ps1
 ```
+> DC workflow will create baseline inbound AD firewall rules for local subnet and disable others. Client workflow will disable all inbound. Backups will be created before and after modification.
 
-Alternatively, initial application with an explicit client network (replace this illustrative range with the actual authorized network):
+Run the Domain Controller workflow using the default `LocalSubnet4` scope:
 
 ```powershell
-.\dc-firewalls-barebones-v3.0.ps1 -ClientNetworks '192.168.1.0/24'
+cd C:\CCDC
+PowerShell.exe -NoProfile -ExecutionPolicy Bypass -File .\fireme-v2.0.ps1 -Role DC
 ```
 
-To change remote scopes on existing enabled local script-managed barebones inbound rules, use `-Modify`, which requires an explicit `-ClientNetworks` argument:
+Run it with an explicit authorized client network:
 
 ```powershell
-.\dc-firewalls-barebones-v3.0.ps1 -Modify -ClientNetworks '192.168.1.0/24'
+PowerShell.exe -NoProfile -ExecutionPolicy Bypass -File .\fireme-v2.0.ps1 -Role DC -ClientNetworks '192.168.1.0/24'
 ```
 
-Equivalent `powershell.exe` execution forms follow. Choose the intended operation; these are alternatives, not an installation sequence:
+The Domain Controller workflow creates or updates 13 inbound AD Allow rules covering DNS, Kerberos, LDAP, SMB, RPC, dynamic RPC, NTP, and Global Catalog services. It then disables other enabled local inbound rules. Group Policy rules may remain effective, and services such as SSH, RDP, and WinRM may require separate accommodation.
+
+To update remote scopes on existing managed AD rules:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\dc-firewalls-barebones-v3.0.ps1
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\dc-firewalls-barebones-v3.0.ps1 -ClientNetworks '192.168.1.0/24'
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\dc-firewalls-barebones-v3.0.ps1 -Modify -ClientNetworks '192.168.1.0/24'
+PowerShell.exe -NoProfile -ExecutionPolicy Bypass -File .\fireme-v2.0.ps1 -Modify -ClientNetworks '192.168.1.0/24'
 ```
 
-Initial setup creates and verifies 13 inbound AD Allow rules (reusing/updating matching managed rules on subsequent initial runs), enables Domain, Private, and Public firewall profiles, and **disables other enabled local inbound rules, including both Allow and Block rules**. SSH, RDP, WinRM, additional scored services, and other AD services may lose access unless separately accommodated. Group Policy firewall rules can remain effective. The script does not explicitly set `DefaultInboundAction` to Block. Test effective policy and required connectivity; installation never executes this script automatically.
-
-Backups and reports always go to `C:\CCDC\FirewallBackups`, regardless of a custom installer destination. Initial setup exports a BEFORE policy backup and readable rule report (`firewall-before-<timestamp>.wfw` / `.txt`) before applying changes, then an AFTER backup and report (`firewall-after-<timestamp>.wfw` / `.txt`). It prints a `netsh advfirewall import` rollback command; rollback is not automatic. `-Modify` exports the after-modification policy and change report (`firewall-modify-after-<timestamp>.wfw` / `.txt`) but does not create a separate before-modification backup.
+Full runs create before/after firewall policy backups and readable reports under `C:\CCDC\FirewallBackups`. Modify runs create before/after modification backups and reports. The script prints a `netsh advfirewall import` rollback command; rollback is not automatic.
 
 ### Password reset scripts
 
@@ -180,7 +182,7 @@ The following approved SHA256 values were verified before import. Files retain t
 
 | Imported file | SHA256 |
 | --- | --- |
-| `Firewall/dc-firewalls-barebones-v3.0.ps1` | `9b373c5811eb7215ba2b767c172c762828cab0d548d1da4471b3c28b953b16ef` |
+| `Firewall/fireme-v2.0.ps1` | `BEC1EB85402EDC181EB3AAF127CCBC8AF18AD0DF799D959CE4088F87888C06D6` |
 | `Passwords/pcr.ps1` | `09f6e600788419b10c734a32f5fcc17545d1b6ad347bc6c69807dda8159b93ac` |
 | `Passwords/pcra.ps1` | `b7536d3e2e59c6f786c0610494fc779a033fa69f7c37b0cd35c36fd9ad17ec57` |
 | `Passwords/restore_passwords.ps1` | `17f815732156f00421e97a221b4036af20f89b091ddd263a83ebf08b13c9df8b` |
