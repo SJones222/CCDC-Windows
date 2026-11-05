@@ -1037,7 +1037,13 @@ try {
             Assert-True ($csv.Count -eq $dataset.Count -and $dataset.Items.Count -eq $dataset.Count)
         }
         $csv = @(Import-Csv -LiteralPath (Join-Path $location.Directory 'processes.csv'))
-        Assert-True ($csv[1].RelatedServiceIds -eq '[]' -and @($csv[0].SourceKinds | ConvertFrom-Json).Count -eq 2)
+        $sourceKinds = ConvertFrom-Json -InputObject $csv[0].SourceKinds
+        Assert-True (
+            $csv[1].RelatedServiceIds -eq '[]' -and
+            $sourceKinds.Count -eq 2 -and
+            $sourceKinds -contains 'RunningService' -and
+            $sourceKinds -contains 'TCPListener'
+        )
         foreach ($name in @('summary.txt', 'services.csv', 'software.csv', 'network-endpoints.csv', 'processes.csv')) {
             $text = [IO.File]::ReadAllText((Join-Path $location.Directory $name))
             Assert-True (-not $text.Contains('SYNTHETIC_PROCESS_SECRET') -and -not $text.Contains('SYNTHETIC_SECRET_MARKER'))
