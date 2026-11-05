@@ -76,6 +76,7 @@ function Reset-Fixture {
     $script:WrittenNames = New-Object 'System.Collections.Generic.List[string]'
     $script:AncestorChecks = New-Object 'System.Collections.Generic.List[string]'
     $script:UnsafeAncestor = $null
+    $script:AncestorOwners = @{}
     function script:Get-CimInstance {
         [CmdletBinding()]
         param([string]$ClassName, [string[]]$Property, [int]$OperationTimeoutSec)
@@ -105,7 +106,9 @@ function Reset-Fixture {
         [CmdletBinding()]
         param([string]$LiteralPath)
         $script:AncestorChecks.Add($LiteralPath)
-        $sddl = 'O:' + $script:UserSid + 'G:SYD:(A;;FA;;;' + $script:UserSid + ')(A;;FRFX;;;AU)'
+        $owner = $script:UserSid
+        if ($script:AncestorOwners.ContainsKey($LiteralPath)) { $owner = $script:AncestorOwners[$LiteralPath] }
+        $sddl = 'O:' + $owner + 'G:SYD:(A;;FA;;;' + $owner + ')(A;;FA;;;' + $script:UserSid + ')(A;;FRFX;;;AU)'
         if ($LiteralPath -eq $script:UnsafeAncestor) { $sddl += '(A;;0x00000040;;;AU)' }
         $acl = [pscustomobject]@{ Descriptor = [System.Security.AccessControl.RawSecurityDescriptor]::new($sddl) }
         $acl | Add-Member ScriptMethod GetSecurityDescriptorBinaryForm {
@@ -312,9 +315,30 @@ try {
         $unknownOwner = [System.Security.AccessControl.RawSecurityDescriptor]::new(($sddl.Replace(('O:' + $script:UserSid), 'O:AU')))
         Assert-True (-not (Test-RestrictedDescriptor $unknownOwner $script:Allowed -Ancestor))
     }
+    Run-Test 'Windows ancestor ownership does not broaden report access' {
+        $servicingSid = 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'
+        foreach ($owner in @($script:UserSid, 'S-1-5-18', 'S-1-5-32-544', $servicingSid)) {
+            $sddl = 'O:' + $owner + 'G:SYD:(A;;FA;;;' + $owner + ')(A;;FA;;;' + $servicingSid + ')(A;;FRFX;;;BU)(A;;0x00000004;;;AU)'
+            $normal = [System.Security.AccessControl.RawSecurityDescriptor]::new($sddl)
+            Assert-True (Test-RestrictedDescriptor $normal $script:Allowed -Ancestor)
+            Assert-True (-not (Test-RestrictedDescriptor $normal $script:Allowed))
+            $unsafe = [System.Security.AccessControl.RawSecurityDescriptor]::new(($sddl + '(A;;0x00000040;;;AU)'))
+            Assert-True (-not (Test-RestrictedDescriptor $unsafe $script:Allowed -Ancestor))
+        }
+        # Even an otherwise private DACL cannot give a report an unexpected owner
+        # or grant its contents to the ancestor-only servicing principal.
+        $private = 'G:SYD:(A;;FA;;;' + $script:UserSid + ')(A;;FA;;;SY)(A;;FA;;;BA)'
+        $servicingOwner = [System.Security.AccessControl.RawSecurityDescriptor]::new(('O:' + $servicingSid + $private))
+        Assert-True (-not (Test-RestrictedDescriptor $servicingOwner $script:Allowed))
+        $servicingRead = [System.Security.AccessControl.RawSecurityDescriptor]::new(('O:' + $script:UserSid + $private + '(A;;FR;;;' + $servicingSid + ')'))
+        Assert-True (-not (Test-RestrictedDescriptor $servicingRead $script:Allowed))
+    }
     Run-Test 'existing ancestors are checked before creating a missing report tree' {
         Set-Item -Path Function:script:Assert-ReportAncestors -Value $definitions['Assert-ReportAncestors']
         $missing = Join-Path $script:TestRoot 'MissingRoot\Host\Run'
+        $script:AncestorOwners[[IO.Path]::GetPathRoot($missing)] = 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'
+        $script:AncestorOwners[[IO.Directory]::GetParent($script:TestRoot).FullName] = 'S-1-5-18'
+        $script:AncestorOwners[$script:TestRoot] = 'S-1-5-32-544'
         Assert-ReportAncestors $missing $script:Allowed
         Assert-True ($script:AncestorChecks -contains $script:TestRoot)
         Assert-True ($script:AncestorChecks -contains [IO.Path]::GetPathRoot($missing))

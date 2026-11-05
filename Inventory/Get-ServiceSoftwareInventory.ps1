@@ -295,14 +295,20 @@ function Test-LocalNonReparsePath {
 
 function Test-RestrictedDescriptor {
     param([System.Security.AccessControl.RawSecurityDescriptor]$Descriptor, [string[]]$AllowedSids, [switch]$Ancestor)
-    if ($null -eq $Descriptor.Owner -or $AllowedSids -notcontains $Descriptor.Owner.Value) { return $false }
+    $trustedSids = @($AllowedSids)
+    if ($Ancestor) {
+        # Windows servicing may own/control ordinary ancestors, but is not added
+        # to the stricter allowlist for report directories or report contents.
+        $trustedSids += 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464' # TrustedInstaller
+    }
+    if ($null -eq $Descriptor.Owner -or $trustedSids -notcontains $Descriptor.Owner.Value) { return $false }
     if (([int]$Descriptor.ControlFlags -band [int][System.Security.AccessControl.ControlFlags]::DiscretionaryAclPresent) -eq 0 -or
         $null -eq $Descriptor.DiscretionaryAcl) { return $false }
     foreach ($ace in $Descriptor.DiscretionaryAcl) {
         # Unknown/callback ACEs are not interpreted as safe; no effective-access engine.
         if ($ace -isnot [System.Security.AccessControl.CommonAce] -or $ace.IsCallback) { return $false }
         if ($ace.AceQualifier -eq [System.Security.AccessControl.AceQualifier]::AccessAllowed) {
-            if ($AllowedSids -contains $ace.SecurityIdentifier.Value) { continue }
+            if ($trustedSids -contains $ace.SecurityIdentifier.Value) { continue }
             $inheritOnly = (([int]$ace.AceFlags -band [int][System.Security.AccessControl.AceFlags]::InheritOnly) -ne 0)
             if ($Ancestor) {
                 # Other users may read/traverse or create siblings, but not replace
@@ -322,8 +328,8 @@ function Test-RestrictedDescriptor {
 
 function Assert-ReportAncestors {
     param([string]$Path, [string[]]$AllowedSids)
-    # Check existing ancestors even before creating a missing output root. The same
-    # owner allowlist applies; unfamiliar owners/ACEs fail closed, without ACL edits.
+    # Ancestors permit Windows servicing ownership and ordinary read/traverse;
+    # untrusted replacement/control rights still fail closed, without ACL edits.
     $cursor = [IO.Directory]::GetParent($Path)
     while ($null -ne $cursor) {
         try { $attributes = [IO.File]::GetAttributes($cursor.FullName) }

@@ -112,13 +112,23 @@ class FoundationSourceTests(unittest.TestCase):
 
     def test_acl_policy_rejects_uncertainty_without_changes(self):
         policy = function("Test-RestrictedDescriptor")
-        for fragment in ["Descriptor.Owner", "DiscretionaryAclPresent", "$ace.IsCallback", "AllowedSids -notcontains"]:
+        for fragment in ["Descriptor.Owner", "DiscretionaryAclPresent", "$ace.IsCallback", "trustedSids -notcontains"]:
             self.assertIn(fragment, policy)
         self.assertIn("'S-1-5-18', 'S-1-5-32-544'", SOURCE)
         self.assertIn("GetSecurityDescriptorBinaryForm()", SOURCE)
         self.assertNotIn(".Translate(", SOURCE)
         self.assertNotIn("SetAccessRule", SOURCE)
         self.assertNotIn("SetAccessControl", SOURCE)
+
+    def test_windows_servicing_trust_is_ancestor_only(self):
+        policy = function("Test-RestrictedDescriptor")
+        self.assertIn("$trustedSids = @($AllowedSids)", policy)
+        self.assertRegex(policy, r"if \(\$Ancestor\) \{\s*(?:#[^\n]*\n\s*)*\$trustedSids \+= 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'")
+        self.assertIn("$trustedSids -contains $ace.SecurityIdentifier.Value", policy)
+        self.assertNotIn("$AllowedSids +=", policy)
+        actual_reports = function("Assert-ProtectedReportPath")
+        self.assertIn("Test-RestrictedDescriptor $descriptor $AllowedSids)", actual_reports)
+        self.assertNotIn("Test-RestrictedDescriptor $descriptor $AllowedSids -Ancestor", actual_reports)
 
     def test_no_reparse_or_network_report_paths(self):
         local = function("Test-LocalNonReparsePath")
