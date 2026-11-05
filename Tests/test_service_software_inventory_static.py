@@ -23,17 +23,18 @@ class FoundationSourceTests(unittest.TestCase):
     def test_powershell_51_and_stage_identity(self):
         self.assertTrue(SOURCE.startswith("#requires -Version 5.1\n"))
         for value in ["service-software-inventory", "SchemaVersion = '0.1.0'", "Version = '0.1.0'",
-                      "DevelopmentStage = 'Milestone 1.2A'", "ReleaseReady = $false"]:
+                      "DevelopmentStage = 'Milestone 1.2B'", "ReleaseReady = $false"]:
             self.assertIn(value, SOURCE)
         self.assertNotRegex(SOURCE, r"\?\?|\?\.|ForEach-Object\s+-Parallel|^using namespace")
 
     def test_service_query_is_single_local_all_states(self):
-        query = next(line for line in SOURCE.splitlines() if "Get-CimInstance -ClassName" in line)
+        service = function("Get-ServiceDataset")
+        query = next(line for line in service.splitlines() if "Get-CimInstance -ClassName" in line)
         self.assertIn("Win32_Service", query)
         self.assertIn("-OperationTimeoutSec 30", query)
         self.assertNotIn("-Filter", query)
         self.assertNotRegex(SOURCE, r"-(?:ComputerName|CimSession)\b")
-        self.assertEqual(SOURCE.count("Get-CimInstance -ClassName"), 1)
+        self.assertEqual(service.count("Get-CimInstance -ClassName"), 1)
 
     def test_service_account_null_requires_a_present_property_and_successful_read(self):
         converter = function("Convert-ServiceRecord")
@@ -59,17 +60,17 @@ class FoundationSourceTests(unittest.TestCase):
         self.assertIn("$root.BaseKey.Dispose()", SOURCE)
 
     def test_no_unapproved_collectors_or_state_changes(self):
-        for prohibited in ["Win32_Product", "Win32_Process", "Get-NetTCPConnection", "Get-NetUDPEndpoint",
+        for prohibited in ["Win32_Product",
                            "Get-AuthenticodeSignature", "Get-FileHash", "Set-Acl", "Set-AD", "Set-Service",
                            "Start-Service", "Stop-Service", "Invoke-WebRequest", "DownloadFile", "SetValue(",
                            "Import-Module", "Invoke-Expression", "Start-Process"]:
             self.assertNotIn(prohibited, SOURCE)
 
-    def test_placeholders_do_not_claim_required_process_success(self):
-        self.assertIn("@{ Id = 'Processes'; Required = $true }", SOURCE)
-        self.assertIn("@{ Id = 'NetworkEndpoints'; Required = $false }", SOURCE)
-        self.assertIn("@{ Id = 'ExecutableFiles'; Required = $false }", SOURCE)
-        self.assertIn("Unavailable @() @('NotImplemented:", SOURCE)
+    def test_only_file_enrichment_remains_an_explicit_placeholder(self):
+        self.assertIn("New-InventoryDataset Processes $true $core.Status", SOURCE)
+        self.assertIn("New-InventoryDataset NetworkEndpoints $false", SOURCE)
+        self.assertIn("New-InventoryDataset ExecutableFiles $false Unavailable", SOURCE)
+        self.assertEqual(SOURCE.count("Prerequisite NotImplemented"), 1)
         self.assertIn("Status = 'Skipped'; ReasonCode = 'SignatureNetworkPolicy'", SOURCE)
         self.assertIn("Status = 'NotPerformed'; Findings = @()", SOURCE)
 
@@ -115,7 +116,8 @@ class FoundationSourceTests(unittest.TestCase):
 
     def test_csv_columns_match_approved_spec_and_exclude_raw(self):
         publisher = function("Publish-InventoryReports")
-        for name, variable in [("services.csv", "serviceColumns"), ("software.csv", "softwareColumns")]:
+        for name, variable in [("services.csv", "serviceColumns"), ("software.csv", "softwareColumns"),
+                               ("network-endpoints.csv", "endpointColumns"), ("processes.csv", "processColumns")]:
             actual = re.search(r"\$" + variable + r" = '([^']+)'\.Split", publisher).group(1)
             line = next(row for row in SPEC.splitlines() if row.startswith("| `" + name + "` |"))
             expected = line.split("|")[2].strip().strip("`")
@@ -218,9 +220,75 @@ class FoundationSourceTests(unittest.TestCase):
         self.assertEqual(main.count("Get-ServiceDataset"), 1)
         self.assertEqual(main.count("Get-SoftwareDataset"), 1)
         self.assertIn("if (-not $report.Output.FallbackUsed)", main)
-        self.assertIn("Files = @('summary.txt', 'services.csv', 'software.csv', 'service-software.json')", main)
-        for filename in ["network-endpoints.csv", "processes.csv", "files.csv"]:
-            self.assertNotIn(filename, SOURCE)
+        self.assertIn("Files = @('summary.txt', 'services.csv', 'software.csv', 'network-endpoints.csv', 'processes.csv', 'service-software.json')", main)
+        self.assertNotIn("'files.csv'", SOURCE)
+        self.assertEqual(main.count("Get-EndpointDataset"), 1)
+        self.assertEqual(main.count("Get-ProcessDataset"), 1)
+
+    def test_provider_helper_checks_scalars_before_success_stream_enumeration(self):
+        helper = function("Read-ObservedProperty")
+        self.assertIn("throw 'ProviderPropertyMissing'", helper)
+        self.assertIn("$value = $getter.GetValue($property, $null)", helper)
+        self.assertIn("if ($null -eq $value) { return $null }", helper)
+        self.assertIn("$value -is [System.Collections.IEnumerable] -and $value -isnot [string]", helper)
+        self.assertLess(helper.index("throw 'ProviderScalarExpected'"), helper.index("return $value"))
+        self.assertNotIn("return ,", helper)
+        self.assertNotIn("Write-Output", helper)
+        self.assertNotIn("catch", helper)
+
+    def test_process_queries_are_targeted_numeric_batches_with_timeout(self):
+        query = function("Invoke-ProcessTargetQueries")
+        self.assertIn("$offset += 32", query)
+        self.assertIn("$offset + 31", query)
+        self.assertIn("'ProcessId = ' + $_.ProcessId", query)
+        self.assertIn("-Filter $filter -OperationTimeoutSec 30 -ErrorAction Stop", query)
+        self.assertEqual(SOURCE.count("Get-CimInstance -ClassName Win32_Process"), 1)
+        self.assertNotIn("Select-Object -First", query)
+        self.assertIn("$batchMap.ContainsKey($key)", query)
+        self.assertIn("$state.Seen.ContainsKey($key)", query)
+
+    def test_required_and_additional_process_scopes_are_independent(self):
+        processes = function("Get-ProcessDataset")
+        self.assertIn("$core = Invoke-ProcessTargetQueries $requiredTargets", processes)
+        self.assertIn("$additionalTargets | Select-Object -First 128", processes)
+        self.assertIn("$additionalTargets | Select-Object -Skip 128", processes)
+        self.assertIn("Sort-Object { [uint32]$_ }", processes)
+        self.assertIn("$core.Status -in @('Success', 'Partial')", processes)
+        self.assertIn("if (-not $known)", processes)
+        self.assertIn("$core.Status = $Services.Status", processes)
+        self.assertIn("SourceId = 'ServiceProcessTargets'; Required = $true; Status = $core.Status", processes)
+        self.assertIn("SourceId = 'AdditionalEndpointTargets'; Required = $false; Status = $extra.Status", processes)
+        self.assertNotIn("$core.Status = $extra.Status", processes)
+
+    def test_endpoints_preserve_protocols_duplicates_and_error_identity(self):
+        endpoints = function("Get-EndpointDataset")
+        self.assertIn("Get-NetTCPConnection -State Listen -ErrorAction Stop", endpoints)
+        self.assertIn("Get-NetUDPEndpoint -ErrorAction Stop", endpoints)
+        self.assertIn("CmdletizationQuery_NotFound_State", endpoints)
+        self.assertIn("CategoryInfo.Category -eq 'ObjectNotFound'", endpoints)
+        self.assertIn("Ordinal = $rows.Count", endpoints)
+        self.assertNotIn("-Unique", endpoints)
+        self.assertIn("'Listening' } else { 'Bound'", function("Convert-EndpointRecord"))
+
+    def test_correlations_are_run_local_and_explicitly_uncertain(self):
+        processes = function("Get-ProcessDataset")
+        for field in ["SourceKinds", "RelatedServiceIds", "EndpointIds", "TargetOutcomes", "InputStatus"]:
+            self.assertIn(field, processes)
+        self.assertIn("'NoObservedMatch' } else { 'Unknown'", processes)
+        self.assertIn("$created -gt $sourceEnd", function("Get-ProcessAssociationStatus"))
+        self.assertIn("PID-only, non-atomic", SOURCE)
+
+    def test_process_raw_fields_are_json_only_and_array_csv_cells_are_json(self):
+        converter = function("Convert-ProcessRecord")
+        for field in ["RawCommandLine = $null", "RawCommandLineState = 'Unavailable'", "CreatedAt = $null"]:
+            self.assertIn(field, converter)
+        self.assertIn("'Empty' } else { 'Collected'", converter)
+        summary = function("Get-ServiceSoftwareSummary")
+        self.assertNotIn(".RawCommandLine", summary)
+        self.assertNotIn(".CommandLine", summary)
+        self.assertIn("Select-Object -First 10", summary)
+        self.assertIn("$remaining = 10", summary)
+        self.assertIn("'MissingValueNames', 'SourceKinds', 'RelatedServiceIds', 'EndpointIds'", function("Convert-InventoryCsv"))
 
     def test_native_suite_has_explicit_windows_host_and_51_constraints(self):
         suite = (ROOT / "Tests/Test-ServiceSoftwareInventory.ps1").read_text()

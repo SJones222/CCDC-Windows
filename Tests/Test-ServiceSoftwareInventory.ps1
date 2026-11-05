@@ -1,7 +1,7 @@
 #requires -Version 5.1
 <#
 .SYNOPSIS
-    Dependency-free synthetic tests for Milestone 1.2A. Run in Windows PowerShell 5.1.
+    Dependency-free synthetic tests for Milestone 1.2B. Run in Windows PowerShell 5.1.
 .DESCRIPTION
     Loads function ASTs only, never the collector's entry point. CIM, registry roots,
     and filesystem ACL probes are mocked. Writes synthetic reports to its own temp
@@ -58,6 +58,55 @@ function New-FakeKey {
     $key
 }
 
+function New-FakeProcessRecord {
+    param([uint32]$Number)
+    [pscustomobject]@{
+        ProcessId = $Number; Name = 'SyntheticProcess_' + $Number
+        CreationDate = [datetime]::Parse('2000-01-01T00:00:00Z').ToUniversalTime()
+        ExecutablePath = 'C:\Fixture\Process.exe'; CommandLine = 'Synthetic command SYNTHETIC_PROCESS_SECRET'
+    }
+}
+
+function New-FakeEndpointRecord {
+    param([uint32]$OwnerId, [int]$Port = 80, [string]$Address = '127.0.0.1')
+    [pscustomobject]@{ OwningProcess = $OwnerId; LocalPort = $Port; LocalAddress = $Address }
+}
+
+function Invoke-TestProcessCollection {
+    $services = Get-ServiceDataset
+    $endpoints = Get-EndpointDataset
+    $budget = [ordered]@{}
+    $processes = Get-ProcessDataset $services $endpoints $budget
+    [pscustomobject]@{ Services = $services; Endpoints = $endpoints; Processes = $processes; Budget = $budget }
+}
+
+function Assert-ProcessReferences {
+    param($Result)
+    Assert-True ((Get-AggregateStatus $Result.Processes.Coverage) -eq $Result.Processes.Status)
+    $serviceIds = @($Result.Services.Items | ForEach-Object { $_.Id })
+    $endpointIds = @($Result.Endpoints.Items | ForEach-Object { $_.Id })
+    $processIds = @($Result.Processes.Items | ForEach-Object { $_.Id })
+    Assert-True (@($processIds | Select-Object -Unique).Count -eq $processIds.Count)
+    Assert-True (@($endpointIds | Select-Object -Unique).Count -eq $endpointIds.Count)
+    foreach ($item in @($Result.Services.Items) + @($Result.Endpoints.Items)) {
+        if ($null -ne $item.ProcessRecordId) { Assert-True ($processIds -contains $item.ProcessRecordId) }
+    }
+    foreach ($item in $Result.Processes.Items) {
+        foreach ($reference in $item.RelatedServiceIds) { Assert-True ($serviceIds -contains $reference) }
+        foreach ($reference in $item.EndpointIds) { Assert-True ($endpointIds -contains $reference) }
+    }
+    foreach ($item in $Result.Endpoints.Items) {
+        foreach ($reference in $item.RelatedServiceIds) { Assert-True ($serviceIds -contains $reference) }
+    }
+    foreach ($target in $Result.Processes.TargetOutcomes) {
+        if ($null -ne $target.ProcessRecordId) { Assert-True ($processIds -contains $target.ProcessRecordId) }
+    }
+    foreach ($usage in $Result.Budget.Values) {
+        if ($null -ne $usage.CandidateCount) { Assert-True ($usage.CandidateCount -eq $usage.AttemptedCount + $usage.SkippedCount) }
+        Assert-True ($usage.AttemptedCount -eq $usage.CompletedCount + $usage.UnusableCount)
+    }
+}
+
 function Reset-Fixture {
     foreach ($name in $definitions.Keys) { Set-Item -Path ('Function:script:' + $name) -Value $definitions[$name] }
     $script:CollectionIssues = New-Object 'System.Collections.Generic.List[object]'
@@ -77,16 +126,78 @@ function Reset-Fixture {
     $script:AncestorChecks = New-Object 'System.Collections.Generic.List[string]'
     $script:UnsafeAncestor = $null
     $script:AncestorOwners = @{}
+    $script:ProcessMode = 'Success'; $script:ProcessBatchModes = @{}; $script:ProcessRows = @{}
+    $script:ProcessBatches = New-Object 'System.Collections.Generic.List[object]'
+    $script:EndpointModes = @{ TCP = 'Success'; UDP = 'Success' }
+    $script:EndpointCalls = @{ TCP = 0; UDP = 0 }
+    $script:FakeEndpoints = @{ TCP = @(); UDP = @() }
     function script:Get-CimInstance {
         [CmdletBinding()]
-        param([string]$ClassName, [string[]]$Property, [int]$OperationTimeoutSec)
+        param([string]$ClassName, [string[]]$Property, [int]$OperationTimeoutSec, [string]$Filter)
+        if ($ClassName -eq 'Win32_Process') {
+            if (($Property -join ',') -ne 'ProcessId,Name,CreationDate,ExecutablePath,CommandLine' -or
+                $OperationTimeoutSec -ne 30 -or $Filter -notmatch '^ProcessId = [0-9]+( OR ProcessId = [0-9]+)*$') { throw 'Unexpected process query.' }
+            $numbers = [uint32[]]@([regex]::Matches($Filter, 'ProcessId = ([0-9]+)') | ForEach-Object { [uint32]$_.Groups[1].Value })
+            if ($numbers.Count -gt 32 -or $numbers.Count -eq 0 -or $numbers -contains 0) { throw 'Unexpected process batch.' }
+            $batchNumber = $script:ProcessBatches.Count
+            $script:ProcessBatches.Add([pscustomobject]@{ Pids = $numbers; Filter = $Filter })
+            $mode = $script:ProcessMode
+            if ($script:ProcessBatchModes.ContainsKey($batchNumber)) { $mode = $script:ProcessBatchModes[$batchNumber] }
+            if ($mode -eq 'Denied') { throw [UnauthorizedAccessException]::new('Synthetic process denial') }
+            if ($mode -eq 'Missing') { throw [System.Management.Automation.CommandNotFoundException]::new('Synthetic capability') }
+            if ($mode -eq 'Failed') { throw [InvalidOperationException]::new('Synthetic process failure') }
+            if ($mode -eq 'Empty') { return }
+            foreach ($number in $numbers) {
+                if ($script:ProcessRows.ContainsKey([string]$number)) { $script:ProcessRows[[string]$number] }
+                else {
+                    New-FakeProcessRecord $number
+                }
+                if ($mode -eq 'AfterOne') { throw [InvalidOperationException]::new('Synthetic late process failure') }
+            }
+            return
+        }
         if ($ClassName -ne 'Win32_Service' -or $OperationTimeoutSec -ne 30) { throw 'Unexpected query.' }
+        if ($Filter) { throw 'Unexpected service filter.' }
         $script:CimCalls++
         if ($script:CimMode -eq 'Denied') { throw [UnauthorizedAccessException]::new('Synthetic denial') }
         if ($script:CimMode -eq 'Missing') { throw [System.Management.Automation.CommandNotFoundException]::new('Synthetic capability') }
         if ($script:CimMode -eq 'Failed') { throw [InvalidOperationException]::new('Synthetic provider failure') }
         if ($script:CimMode -eq 'AfterOne') { Write-Output $script:FakeServices[0]; throw 'Synthetic late failure' }
         $script:FakeServices
+    }
+    function script:Get-FakeEndpointRows {
+        [CmdletBinding()]
+        param([string]$Protocol)
+        $script:EndpointCalls[$Protocol]++
+        $mode = $script:EndpointModes[$Protocol]
+        if ($mode -eq 'Denied') { throw [UnauthorizedAccessException]::new('Synthetic endpoint denial') }
+        if ($mode -eq 'Missing') { throw [System.Management.Automation.CommandNotFoundException]::new('Synthetic endpoint capability') }
+        if ($mode -eq 'Failed') { throw [InvalidOperationException]::new('Synthetic endpoint failure') }
+        if ($mode -in @('NoMatch', 'GenericNoMatch', 'UnknownNotFound')) {
+            $errorId = switch ($mode) {
+                'NoMatch' { 'CmdletizationQuery_NotFound_State' }
+                'GenericNoMatch' { 'CmdletizationQuery_NotFound' }
+                default { 'SyntheticUnknownNotFound' }
+            }
+            $record = [System.Management.Automation.ErrorRecord]::new([InvalidOperationException]::new('Synthetic no match'),
+                $errorId, [System.Management.Automation.ErrorCategory]::ObjectNotFound, $null)
+            $PSCmdlet.ThrowTerminatingError($record)
+        }
+        foreach ($row in $script:FakeEndpoints[$Protocol]) {
+            $row
+            if ($mode -eq 'AfterOne') { throw [InvalidOperationException]::new('Synthetic late endpoint failure') }
+        }
+    }
+    function script:Get-NetTCPConnection {
+        [CmdletBinding()]
+        param([string]$State)
+        if ($State -ne 'Listen') { throw 'Unexpected TCP query.' }
+        Get-FakeEndpointRows TCP
+    }
+    function script:Get-NetUDPEndpoint {
+        [CmdletBinding()]
+        param()
+        Get-FakeEndpointRows UDP
     }
     function script:Open-UninstallRoot {
         param([string]$View)
@@ -134,7 +245,7 @@ function New-TestLocation {
         Directory = $directory; TemporaryPaths = [ordered]@{}
         CreatedPaths = (New-Object 'System.Collections.Generic.List[string]')
     }
-    foreach ($name in @('summary.txt', 'services.csv', 'software.csv', 'service-software.json')) {
+    foreach ($name in @('summary.txt', 'services.csv', 'software.csv', 'network-endpoints.csv', 'processes.csv', 'service-software.json')) {
         $path = Join-Path $directory ($name + '.tmp')
         [IO.File]::Open($path, [IO.FileMode]::CreateNew).Dispose()
         $location.TemporaryPaths[$name] = $path
@@ -147,18 +258,22 @@ function New-TestReport {
     param($Location)
     $services = Get-ServiceDataset
     $software = Get-SoftwareDataset
-    $processes = New-InventoryDataset Processes $true Unavailable @() @('NotImplemented')
+    $endpoints = Get-EndpointDataset
+    $budget = [ordered]@{}
+    $processes = Get-ProcessDataset $services $endpoints $budget
+    $files = New-InventoryDataset ExecutableFiles $false Unavailable @() @('NotImplemented')
+    $datasets = @($services, $software, $endpoints, $processes, $files)
     [ordered]@{
         SchemaVersion = '0.1.0'; ModuleId = 'service-software-inventory'; Version = '0.1.0'
-        DevelopmentStage = 'Milestone 1.2A'; ReleaseReady = $false
+        DevelopmentStage = 'Milestone 1.2B'; ReleaseReady = $false
         RunId = [guid]::NewGuid().ToString(); Hostname = 'SYNTHETIC_HOST'
         StartedAt = [datetime]::UtcNow.ToString('o'); CompletedAt = [datetime]::UtcNow.ToString('o')
-        Collection = [ordered]@{ Status = 'Partial'; Datasets = @($services, $software, $processes); Issues = @($script:CollectionIssues.ToArray()) }
+        Collection = [ordered]@{ Status = Get-AggregateStatus $datasets; Datasets = $datasets; Issues = @($script:CollectionIssues.ToArray()); BudgetUsage = $budget }
         Assessment = [ordered]@{ Status = 'NotPerformed'; Findings = @() }
         Output = [ordered]@{
             Status = 'Failed'; Directory = $Location.Directory; FallbackUsed = $false
             ProtectionStatus = 'VerifiedRestricted'
-            Files = @('summary.txt', 'services.csv', 'software.csv', 'service-software.json'); Issues = @()
+            Files = @('summary.txt', 'services.csv', 'software.csv', 'network-endpoints.csv', 'processes.csv', 'service-software.json'); Issues = @()
         }
     }
 }
@@ -494,7 +609,7 @@ try {
             Assert-True ($script:PublishingReport.Output.Status -eq 'Failed')
             $script:WrittenNames.Add([IO.Path]::GetFileName($Path))
             if ([IO.Path]::GetFileName($Path) -eq 'service-software.json.tmp') {
-                foreach ($name in @('summary.txt', 'services.csv', 'software.csv')) {
+                foreach ($name in @('summary.txt', 'services.csv', 'software.csv', 'network-endpoints.csv', 'processes.csv')) {
                     Assert-True ([IO.File]::Exists((Join-Path ([IO.Path]::GetDirectoryName($Path)) $name)))
                 }
                 Assert-True (($Text | ConvertFrom-Json).Output.Status -eq 'Success')
@@ -507,7 +622,7 @@ try {
         $script:CandidateChecked = $false
         Assert-Throws { Publish-InventoryReports $script:PublishingReport $location $script:Allowed }
         Assert-True ($script:PublishingReport.Output.Status -eq 'Failed' -and $script:CandidateChecked)
-        Assert-True (($script:WrittenNames.ToArray() -join ',') -eq 'summary.txt.tmp,services.csv.tmp,software.csv.tmp,service-software.json.tmp')
+        Assert-True (($script:WrittenNames.ToArray() -join ',') -eq 'summary.txt.tmp,services.csv.tmp,software.csv.tmp,network-endpoints.csv.tmp,processes.csv.tmp,service-software.json.tmp')
     }
     Run-Test 'post-promotion failure retains failed status and cleans canonical JSON first' {
         function script:Assert-ProtectedReportPath {
@@ -539,8 +654,11 @@ try {
         function script:New-ProtectedReportLocation { param($Root,$HostFolder,$RunId,$AllowedSids); throw 'Synthetic unverified output' }
         $result = @(Invoke-ServiceSoftwareInventory $script:TestRoot)
         Assert-True ($result[-1] -eq 3 -and $script:CimCalls -eq 0)
+        Assert-True ($script:ProcessBatches.Count -eq 0 -and $script:EndpointCalls.TCP -eq 0 -and $script:EndpointCalls.UDP -eq 0)
     }
     Run-Test 'preflight fallback, development placeholders, and saved exit 2' {
+        # Retain the partial-collection exit test now that processes are implemented.
+        $script:ProcessMode = 'Denied'
         function script:New-ProtectedReportLocation {
             param($Root,$HostFolder,$RunId,$AllowedSids)
             $script:PreparationFailures++
@@ -554,7 +672,9 @@ try {
         $processes = @($report.Collection.Datasets | Where-Object { $_.Id -eq 'Processes' })[0]
         Assert-True ($processes.Required -and $processes.Status -eq 'Unavailable' -and $null -eq $processes.Count)
         Assert-True ($report.Output.FallbackUsed -and -not $report.ReleaseReady)
-        Assert-True ($report.Output.Files.Count -eq 4)
+        Assert-True ($report.Output.Files.Count -eq 6)
+        $files = @($report.Collection.Datasets | Where-Object { $_.Id -eq 'ExecutableFiles' })[0]
+        Assert-True ($files.Status -eq 'Unavailable' -and $null -eq $files.Count)
     }
     Run-Test 'total publication failure returns 3, never a saved success' {
         function script:New-ProtectedReportLocation { param($Root,$HostFolder,$RunId,$AllowedSids); New-TestLocation }
@@ -564,6 +684,7 @@ try {
         Assert-True (-not (($result[0..($result.Count-2)] -join ' ').Contains('Report-save status: Success')))
     }
     Run-Test 'write failure falls back without collecting twice' {
+        $script:ProcessMode = 'Denied'
         $script:Locations = New-Object 'System.Collections.Generic.List[object]'
         function script:New-ProtectedReportLocation {
             param($Root,$HostFolder,$RunId,$AllowedSids)
@@ -578,9 +699,377 @@ try {
         }
         $result = @(Invoke-ServiceSoftwareInventory $script:TestRoot)
         Assert-True ($result[-1] -eq 2 -and $script:CimCalls -eq 1 -and $script:Locations.Count -eq 2)
+        Assert-True ($script:ProcessBatches.Count -eq 1 -and $script:EndpointCalls.TCP -eq 1 -and $script:EndpointCalls.UDP -eq 1)
         $report = [IO.File]::ReadAllText((Join-Path $script:Locations[1].Directory 'service-software.json')) | ConvertFrom-Json
         Assert-True ($report.Output.FallbackUsed -and @($report.Output.Issues).Count -gt 0)
         Assert-True ((Get-ChildItem -LiteralPath $script:Locations[0].Directory -Force).Count -eq 0)
+    }
+    Run-Test 'provider scalar strings UInt32 and DateTime retain their types and values' {
+        $date = [datetime]::Parse('2000-01-01T00:00:00Z').ToUniversalTime()
+        $source = [pscustomobject]@{ Text = 'Synthetic text'; Number = [uint32]123; Zero = [uint32]0; Date = $date; Empty = '' }
+        $text = Read-ObservedProperty $source Text
+        $number = Read-ObservedProperty $source Number
+        $zero = Read-ObservedProperty $source Zero
+        $time = Read-ObservedProperty $source Date
+        $empty = Read-ObservedProperty $source Empty
+        Assert-True ($text -is [string] -and $text -ceq 'Synthetic text')
+        Assert-True ($number -is [uint32] -and $number -eq 123 -and $zero -is [uint32] -and $zero -eq 0)
+        Assert-True ($time -is [datetime] -and $time -eq $date -and $time.Kind -eq $date.Kind)
+        Assert-True ($empty -is [string] -and $empty -ceq '')
+    }
+    Run-Test 'present null provider values remain null while absent properties throw' {
+        $source = [pscustomobject]@{ Present = $null }
+        $value = Read-ObservedProperty $source Present
+        Assert-True ($null -eq $value)
+        Assert-Throws { $null = Read-ObservedProperty $source Absent }
+    }
+    Run-Test 'wrapped provider access denials remain exceptions and structured access issues' {
+        $source = New-FakeEndpointRecord 123
+        $source | Add-Member ScriptProperty LocalAddress {
+            throw [InvalidOperationException]::new('Synthetic wrapper', [UnauthorizedAccessException]::new('Synthetic protected value'))
+        } -Force
+        $caught = $null
+        try { $null = Read-ObservedProperty $source LocalAddress } catch { $caught = $_ }
+        Assert-True ($null -ne $caught)
+        $failure = Get-CollectionFailure $caught RecordReadFailed
+        Assert-True ($failure.Status -eq 'Unavailable' -and $failure.Code -eq 'AccessDenied')
+        $script:FakeEndpoints.TCP = @($source)
+        $result = Invoke-TestProcessCollection
+        Assert-True ($result.Endpoints.Status -eq 'Partial' -and $result.Endpoints.Items[0].RecordStatus -eq 'Partial')
+        $issue = @($script:CollectionIssues | Where-Object { $_.DatasetId -eq 'NetworkEndpoints' -and $_.Code -eq 'AccessDenied' })
+        Assert-True ($issue.Count -eq 1 -and -not $issue[0].Message.Contains('Synthetic protected value'))
+        Assert-True ($result.Processes.Status -eq 'Success')
+    }
+    Run-Test 'array-valued provider fields are rejected before singleton scalar coercion' {
+        $date = [datetime]::Parse('2000-01-01T00:00:00Z').ToUniversalTime()
+        $source = [pscustomobject]@{
+            Text = [string[]]@('one'); Number = [uint32[]]@(123); Date = [datetime[]]@($date)
+            Empty = [object[]]@(); Multiple = [string[]]@('one', 'two')
+        }
+        foreach ($name in @('Text', 'Number', 'Date', 'Empty', 'Multiple')) {
+            Assert-Throws { $null = Read-ObservedProperty $source $name }
+        }
+        $endpoint = New-FakeEndpointRecord 123; $endpoint.LocalPort = [uint32[]]@(80)
+        $script:FakeEndpoints.TCP = @($endpoint)
+        $process = New-FakeProcessRecord 123; $process.Name = [string[]]@('SyntheticProcess_123')
+        $script:ProcessRows['123'] = $process
+        $result = Invoke-TestProcessCollection
+        Assert-True ($result.Endpoints.Status -eq 'Partial' -and $null -eq $result.Endpoints.Items[0].LocalPort)
+        Assert-True ($result.Processes.Status -eq 'Partial' -and $null -eq $result.Processes.Items[0].Name)
+        Assert-True (@($script:CollectionIssues | Where-Object { $_.Code -eq 'RecordReadFailed' }).Count -eq 2)
+    }
+    Run-Test 'valid scalar endpoint and process metadata are retained as successful records' {
+        $script:FakeEndpoints.TCP = @((New-FakeEndpointRecord 123 443))
+        $script:FakeEndpoints.UDP = @((New-FakeEndpointRecord 123 53 '::'))
+        $result = Invoke-TestProcessCollection
+        Assert-True ($result.Endpoints.Status -eq 'Success' -and $result.Endpoints.Count -eq 2)
+        Assert-True (@($result.Endpoints.Items | Where-Object { $_.RecordStatus -ne 'Success' }).Count -eq 0)
+        Assert-True ($result.Processes.Status -eq 'Success' -and $result.Processes.Count -eq 1 -and $result.Processes.Items[0].RecordStatus -eq 'Success')
+        Assert-True ($result.Processes.Items[0].Name -is [string] -and $result.Processes.Items[0].ProcessId -is [uint32])
+        Assert-True ($script:CollectionIssues.Count -eq 0)
+        Assert-ProcessReferences $result
+    }
+    Run-Test 'empty and known no-match endpoint sources are successful without invented records' {
+        $data = Get-EndpointDataset
+        Assert-True ($data.Status -eq 'Success' -and $data.Count -eq 0 -and $data.Items.Count -eq 0)
+        Assert-True ($data.Coverage.Count -eq 2 -and $script:EndpointCalls.TCP -eq 1 -and $script:EndpointCalls.UDP -eq 1)
+        $script:EndpointModes.TCP = 'NoMatch'
+        $data = Get-EndpointDataset
+        Assert-True ($data.Status -eq 'Success' -and $data.Count -eq 0 -and $script:CollectionIssues.Count -eq 0)
+        $script:EndpointModes.TCP = 'GenericNoMatch'; $script:EndpointModes.UDP = 'GenericNoMatch'
+        $data = Get-EndpointDataset
+        Assert-True ($data.Status -eq 'Success' -and $data.Count -eq 0 -and $script:CollectionIssues.Count -eq 0)
+        $script:EndpointModes.UDP = 'NoMatch'
+        $data = Get-EndpointDataset
+        Assert-True ($data.Status -eq 'Partial' -and $data.Count -eq 0 -and $data.Coverage[1].Status -eq 'Failed')
+        $script:EndpointModes.UDP = 'UnknownNotFound'
+        $data = Get-EndpointDataset
+        Assert-True ($data.Coverage[1].Status -eq 'Failed')
+    }
+    Run-Test 'endpoint sources retain partial results and distinguish denied and failed enumeration' {
+        $script:FakeEndpoints.TCP = @((New-FakeEndpointRecord 123), (New-FakeEndpointRecord 456))
+        $script:EndpointModes.TCP = 'AfterOne'; $script:EndpointModes.UDP = 'Denied'
+        $data = Get-EndpointDataset
+        Assert-True ($data.Status -eq 'Partial' -and $data.Count -eq 1 -and $data.Coverage[0].Status -eq 'Partial' -and $data.Coverage[1].Status -eq 'Unavailable')
+        $script:EndpointModes.TCP = 'Failed'; $script:EndpointModes.UDP = 'Failed'
+        $data = Get-EndpointDataset
+        Assert-True ($data.Status -eq 'Failed' -and $null -eq $data.Count -and $data.Items.Count -eq 0)
+        $script:EndpointModes.TCP = 'Missing'; $script:EndpointModes.UDP = 'Denied'
+        $data = Get-EndpointDataset
+        Assert-True ($data.Status -eq 'Unavailable' -and $null -eq $data.Count)
+    }
+    Run-Test 'shared service PIDs preserve all endpoints and correlate without individual ownership' {
+        $second = $script:FakeServices[0].PSObject.Copy(); $second.Name = 'SecondService'
+        $stopped = $script:FakeServices[0].PSObject.Copy(); $stopped.Name = 'StoppedService'; $stopped.State = 'Stopped'
+        $script:FakeServices += @($second, $stopped)
+        $script:FakeEndpoints.TCP = @((New-FakeEndpointRecord 123 443 '::'), (New-FakeEndpointRecord 123 443 '::'))
+        $script:FakeEndpoints.UDP = @((New-FakeEndpointRecord 123 53 '0.0.0.0'))
+        $result = Invoke-TestProcessCollection
+        Assert-True ($result.Processes.Status -eq 'Success' -and $result.Processes.Count -eq 1 -and $script:ProcessBatches.Count -eq 1)
+        $process = $result.Processes.Items[0]
+        Assert-True ($process.RelatedServiceIds.Count -eq 2 -and $process.EndpointIds.Count -eq 3 -and $process.SourceKinds.Count -eq 3)
+        Assert-True ($result.Endpoints.Count -eq 3 -and $result.Endpoints.Items[2].EndpointType -eq 'Bound')
+        Assert-True ($result.Services.Items[2].ProcessAssociationStatus -eq 'NotApplicable' -and $null -eq $result.Services.Items[2].ProcessRecordId)
+        foreach ($endpoint in $result.Endpoints.Items) {
+            Assert-True ($endpoint.RelatedServiceIds.Count -eq 2 -and $endpoint.AssociationBasis -eq 'PID-only, non-atomic')
+            Assert-True ($endpoint.ServiceAssociationStatus -eq 'UnconfirmedPidMatch' -and $endpoint.ProcessRecordId -eq 'process:123')
+        }
+        Assert-ProcessReferences $result
+    }
+    Run-Test 'endpoint-only processes have optional scope and empty service references' {
+        $script:FakeEndpoints.TCP = @((New-FakeEndpointRecord 900))
+        $result = Invoke-TestProcessCollection
+        $optional = @($result.Processes.Items | Where-Object { -not $_.RequiredForCollection })[0]
+        Assert-True ($result.Processes.Status -eq 'Success' -and $result.Processes.Count -eq 2)
+        Assert-True ($optional.ProcessId -eq 900 -and $optional.RelatedServiceIds.Count -eq 0 -and $optional.SourceKinds[0] -eq 'TCPListener')
+        Assert-True ($result.Endpoints.Items[0].ServiceAssociationStatus -eq 'NoObservedMatch')
+        Assert-True ($script:ProcessBatches.Count -eq 2 -and $script:ProcessBatches[0].Pids[0] -eq 123 -and $script:ProcessBatches[1].Pids[0] -eq 900)
+        $roundTrip = $result.Processes | ConvertTo-Json -Depth 10 | ConvertFrom-Json
+        Assert-True ($roundTrip.Items[1].RelatedServiceIds -is [array] -and $roundTrip.Items[1].RelatedServiceIds.Count -eq 0)
+        Assert-ProcessReferences $result
+    }
+    Run-Test 'endpoint failures never downgrade complete required service-process coverage' {
+        $script:EndpointModes.TCP = 'Failed'; $script:EndpointModes.UDP = 'Denied'
+        $result = Invoke-TestProcessCollection
+        Assert-True ($result.Endpoints.Status -eq 'Failed' -and $result.Processes.Status -eq 'Success' -and $result.Processes.Count -eq 1)
+        Assert-True ($result.Processes.Coverage[0].Status -eq 'Success' -and $result.Processes.Coverage[1].Status -eq 'Failed')
+        Assert-True ($null -eq $result.Budget.AdditionalProcesses.CandidateCount -and $script:ProcessBatches.Count -eq 1)
+        Assert-ProcessReferences $result
+    }
+    Run-Test 'unknown required service scope skips process discovery without guessing optional targets' {
+        $script:FakeEndpoints.TCP = @((New-FakeEndpointRecord 900))
+        foreach ($mode in @('Denied', 'Failed', 'Missing')) {
+            $script:CimMode = $mode
+            $result = Invoke-TestProcessCollection
+            Assert-True ($result.Processes.Status -eq $result.Services.Status -and $null -eq $result.Processes.Count)
+            Assert-True ($result.Processes.TargetOutcomes.Count -eq 0 -and $script:ProcessBatches.Count -eq 0)
+            Assert-True ($result.Endpoints.Items[0].ProcessId -eq 900 -and $result.Endpoints.Items[0].ServiceAssociationStatus -eq 'Unknown')
+            Assert-True ($result.Endpoints.Items[0].ProcessAssociationStatus -eq 'Skipped' -and $null -eq $result.Budget.ServiceProcesses.CandidateCount)
+        }
+    }
+    Run-Test 'complete empty service targets succeed while partial service selection remains partial' {
+        $script:FakeServices[0].State = 'Stopped'; $script:FakeServices[0].ProcessId = 0
+        $script:EndpointModes.TCP = 'Denied'; $script:EndpointModes.UDP = 'Denied'
+        $result = Invoke-TestProcessCollection
+        Assert-True ($result.Processes.Status -eq 'Success' -and $result.Processes.Count -eq 0 -and $script:ProcessBatches.Count -eq 0)
+        Assert-True ($result.Budget.ServiceProcesses.CandidateCount -eq 0)
+        $script:CimMode = 'AfterOne'
+        $result = Invoke-TestProcessCollection
+        Assert-True ($result.Processes.Status -eq 'Partial' -and $result.Processes.Count -eq 0 -and $null -eq $result.Budget.ServiceProcesses.CandidateCount)
+    }
+    Run-Test 'required missing, denied, unavailable, and failed targets have explicit outcomes' {
+        $script:ProcessMode = 'Empty'
+        $empty = Invoke-TestProcessCollection
+        Assert-True ($empty.Processes.Status -eq 'Partial' -and $empty.Processes.Count -eq 0 -and $empty.Processes.TargetOutcomes[0].Outcome -eq 'NotReturned')
+        $script:ProcessMode = 'Success'
+        $script:FakeEndpoints.TCP = @((New-FakeEndpointRecord 900))
+        foreach ($mode in @('Empty', 'Denied', 'Missing', 'Failed')) {
+            # Optional queries would succeed; only the required batch is varied.
+            $script:ProcessBatchModes = @{ 0 = $mode }; $script:ProcessBatches.Clear()
+            $result = Invoke-TestProcessCollection
+            $expectedStatus = @{ Empty = 'Partial'; Denied = 'Unavailable'; Missing = 'Unavailable'; Failed = 'Failed' }
+            $expectedOutcome = @{ Empty = 'NotReturned'; Denied = 'Unavailable'; Missing = 'Unavailable'; Failed = 'Failed' }
+            Assert-True ($result.Processes.Status -eq $expectedStatus[$mode])
+            Assert-True ($result.Processes.TargetOutcomes[0].Outcome -eq $expectedOutcome[$mode])
+            Assert-True ($null -eq $result.Processes.TargetOutcomes[0].ProcessRecordId)
+            if ($mode -eq 'Empty') {
+                Assert-True ($result.Processes.Count -eq 1 -and -not $result.Processes.Items[0].RequiredForCollection)
+                Assert-True ($result.Services.Items[0].ProcessAssociationStatus -eq 'NotReturned' -and $result.Processes.Coverage[0].Status -eq 'Partial')
+                Assert-True ($result.Budget.ServiceProcesses.UnusableCount -eq 1)
+            }
+            else {
+                Assert-True ($null -eq $result.Processes.Count -and $result.Processes.Items.Count -eq 0)
+                Assert-True ($result.Processes.TargetOutcomes[1].Outcome -eq 'Skipped' -and $script:ProcessBatches.Count -eq 1)
+            }
+            Assert-ProcessReferences $result
+        }
+    }
+    Run-Test 'partial process queries retain rows and mark unreturned failed-batch targets' {
+        $second = $script:FakeServices[0].PSObject.Copy(); $second.Name = 'Second'; $second.ProcessId = 124
+        $script:FakeServices += $second
+        $script:ProcessMode = 'AfterOne'
+        $result = Invoke-TestProcessCollection
+        Assert-True ($result.Processes.Status -eq 'Partial' -and $result.Processes.Count -eq 1)
+        Assert-True ($result.Processes.TargetOutcomes[0].Outcome -eq 'Returned' -and $result.Processes.TargetOutcomes[1].Outcome -eq 'Failed')
+        Assert-True ($null -eq $result.Services.Items[1].ProcessRecordId -and $result.Budget.ServiceProcesses.UnusableCount -eq 1)
+        Assert-ProcessReferences $result
+    }
+    Run-Test 'more than 512 running-service PIDs are queried once in batches no larger than 32' {
+        $base = $script:FakeServices[0]
+        $script:FakeServices = @(foreach ($number in 1..513) {
+            $row = $base.PSObject.Copy(); $row.Name = 'BulkService_' + $number; $row.ProcessId = $number; $row
+        })
+        $result = Invoke-TestProcessCollection
+        $queried = @($script:ProcessBatches.ToArray() | ForEach-Object { $_.Pids })
+        Assert-True ($result.Processes.Status -eq 'Success' -and $result.Processes.Count -eq 513)
+        Assert-True ($queried.Count -eq 513 -and @($queried | Select-Object -Unique).Count -eq 513)
+        Assert-True ($script:ProcessBatches.Count -eq 17 -and $script:ProcessBatches[0].Pids.Count -eq 32 -and $script:ProcessBatches[16].Pids.Count -eq 1)
+        Assert-True ($result.Budget.ServiceProcesses.CandidateCount -eq 513 -and $result.Budget.ServiceProcesses.SkippedCount -eq 0)
+        Assert-ProcessReferences $result
+    }
+    Run-Test 'additional PID cap is deterministic at 128 and one over without limiting endpoints' {
+        foreach ($size in @(128, 129)) {
+            $script:ProcessBatches.Clear()
+            $script:FakeEndpoints.TCP = @(for ($number = 1000 + $size - 1; $number -ge 1000; $number--) { New-FakeEndpointRecord $number })
+            $result = Invoke-TestProcessCollection
+            $additional = @($result.Processes.Items | Where-Object { -not $_.RequiredForCollection })
+            Assert-True ($result.Processes.Status -eq 'Success' -and $additional.Count -eq 128 -and $result.Endpoints.Count -eq $size)
+            Assert-True ($additional[0].ProcessId -eq 1000 -and $additional[127].ProcessId -eq 1127)
+            Assert-True ($result.Budget.AdditionalProcesses.CandidateCount -eq $size -and $result.Budget.AdditionalProcesses.SkippedCount -eq $size - 128)
+            $expected = if ($size -eq 128) { 'Success' } else { 'Partial' }
+            Assert-True ($result.Processes.Coverage[1].Status -eq $expected)
+            if ($size -eq 129) {
+                Assert-True ($result.Processes.TargetOutcomes[-1].ProcessId -eq 1128 -and $result.Processes.TargetOutcomes[-1].Outcome -eq 'Skipped')
+                Assert-True ($result.Endpoints.Items[-1].ProcessAssociationStatus -eq 'Skipped')
+            }
+            Assert-ProcessReferences $result
+        }
+    }
+    Run-Test 'successful additional rows cannot hide missing required coverage across batches' {
+        $base = $script:FakeServices[0]
+        $script:FakeServices = @(foreach ($number in 1..33) {
+            $row = $base.PSObject.Copy(); $row.Name = 'BatchService_' + $number; $row.ProcessId = $number; $row
+        })
+        $script:ProcessBatchModes[0] = 'Denied'
+        $script:FakeEndpoints.TCP = @((New-FakeEndpointRecord 900))
+        $result = Invoke-TestProcessCollection
+        Assert-True ($result.Processes.Status -eq 'Partial' -and $result.Processes.Count -eq 2)
+        Assert-True ($result.Processes.Coverage[0].Status -eq 'Partial' -and $result.Processes.Coverage[1].Status -eq 'Success')
+        Assert-True ($result.Budget.ServiceProcesses.UnusableCount -eq 32 -and $result.Budget.ServiceProcesses.CompletedCount -eq 1)
+        Assert-True ($result.Processes.Items[1].ProcessId -eq 900 -and -not $result.Processes.Items[1].RequiredForCollection)
+        Assert-ProcessReferences $result
+    }
+    Run-Test 'partial service selection never becomes complete through endpoint-only rows' {
+        $script:CimMode = 'AfterOne'
+        $script:FakeServices[0].State = 'Stopped'; $script:FakeServices[0].ProcessId = 0
+        $script:FakeEndpoints.UDP = @((New-FakeEndpointRecord 900 53))
+        $result = Invoke-TestProcessCollection
+        Assert-True ($result.Processes.Status -eq 'Partial' -and $result.Processes.Count -eq 1 -and -not $result.Processes.Items[0].RequiredForCollection)
+        Assert-True ($result.Endpoints.Items[0].ServiceAssociationStatus -eq 'Unknown' -and $null -eq $result.Budget.ServiceProcesses.CandidateCount)
+        Assert-ProcessReferences $result
+    }
+    Run-Test 'incomplete endpoint fields remain null and cannot create false associations' {
+        $script:FakeEndpoints.TCP = @([pscustomobject]@{ LocalAddress = $null; LocalPort = $null; OwningProcess = $null })
+        $result = Invoke-TestProcessCollection
+        $row = $result.Endpoints.Items[0]
+        Assert-True ($result.Endpoints.Status -eq 'Partial' -and $result.Endpoints.Count -eq 1 -and $row.RecordStatus -eq 'Partial')
+        Assert-True ($null -eq $row.LocalPort -and $null -eq $row.ProcessId -and $row.ServiceAssociationStatus -eq 'Unknown')
+        Assert-True ($result.Processes.Status -eq 'Success' -and $result.Processes.Count -eq 1 -and $null -eq $result.Budget.AdditionalProcesses.CandidateCount)
+    }
+    Run-Test 'partial required metadata preserves PID and empty commands without copying service configuration' {
+        $row = New-FakeProcessRecord 123; $row.CreationDate = $null; $row.ExecutablePath = $null; $row.CommandLine = ''
+        $script:ProcessRows['123'] = $row
+        $result = Invoke-TestProcessCollection
+        $process = $result.Processes.Items[0]
+        Assert-True ($result.Processes.Status -eq 'Partial' -and $result.Processes.Count -eq 1 -and $process.ProcessId -eq 123)
+        Assert-True ($process.RawCommandLine -ceq '' -and $process.RawCommandLineState -eq 'Empty' -and $null -eq $process.CreatedAt)
+        Assert-True ($result.Processes.TargetOutcomes[0].Outcome -eq 'PartialMetadata' -and $process.AssociationStatus -eq 'UnconfirmedPidMatch')
+        Assert-True ($result.Budget.ServiceProcesses.CompletedCount -eq 1)
+        Assert-ProcessReferences $result
+    }
+    Run-Test 'missing invalid and unreadable process metadata retain partial records and sanitized issues' {
+        foreach ($mode in @('MissingName', 'InvalidDate', 'DeniedPath', 'DeniedCommand')) {
+            $row = New-FakeProcessRecord 123
+            switch ($mode) {
+                'MissingName' { $row.PSObject.Properties.Remove('Name') }
+                'InvalidDate' { $row.CreationDate = 'not-a-provider-date' }
+                'DeniedPath' { $row | Add-Member ScriptProperty ExecutablePath { throw [UnauthorizedAccessException]::new('Synthetic process secret') } -Force }
+                'DeniedCommand' { $row | Add-Member ScriptProperty CommandLine { throw [UnauthorizedAccessException]::new('Synthetic process secret') } -Force }
+            }
+            $script:ProcessRows['123'] = $row
+            $before = $script:CollectionIssues.Count
+            $result = Invoke-TestProcessCollection
+            Assert-True ($result.Processes.Status -eq 'Partial' -and $result.Processes.Count -eq 1 -and $result.Processes.TargetOutcomes[0].Outcome -eq 'PartialMetadata')
+            $issue = $script:CollectionIssues[$before]
+            Assert-True ($issue.RecordId -eq 'process:123' -and -not $issue.Message.Contains('Synthetic process secret'))
+            $expected = if ($mode -like 'Denied*') { 'AccessDenied' } else { 'RecordReadFailed' }
+            Assert-True ($issue.Code -eq $expected)
+            Assert-ProcessReferences $result
+        }
+    }
+    Run-Test 'optional process metadata and query failures cannot downgrade required success' {
+        $script:FakeEndpoints.TCP = @((New-FakeEndpointRecord 900))
+        $row = New-FakeProcessRecord 900; $row.CommandLine = $null
+        $script:ProcessRows['900'] = $row
+        $result = Invoke-TestProcessCollection
+        Assert-True ($result.Processes.Status -eq 'Success' -and $result.Processes.Coverage[1].Status -eq 'Partial')
+        Assert-True ($result.Processes.TargetOutcomes[1].Outcome -eq 'PartialMetadata' -and $result.Processes.Items[1].RawCommandLineState -eq 'Unavailable')
+        $script:ProcessRows.Clear(); $script:ProcessBatches.Clear(); $script:ProcessBatchModes[1] = 'Denied'
+        $result = Invoke-TestProcessCollection
+        Assert-True ($result.Processes.Status -eq 'Success' -and $result.Processes.Coverage[1].Status -eq 'Unavailable')
+        Assert-True ($result.Processes.Count -eq 1 -and $result.Processes.TargetOutcomes[1].Outcome -eq 'Unavailable')
+        Assert-ProcessReferences $result
+    }
+    Run-Test 'source timestamps flag PID reuse without claiming certain service ownership' {
+        $script:FakeEndpoints.TCP = @((New-FakeEndpointRecord 123))
+        $row = New-FakeProcessRecord 123; $row.CreationDate = [datetime]::Parse('2099-01-01T00:00:00Z').ToUniversalTime()
+        $script:ProcessRows['123'] = $row
+        $result = Invoke-TestProcessCollection
+        Assert-True ($result.Services.Items[0].ProcessAssociationStatus -eq 'PossiblePidReuse' -and $result.Endpoints.Items[0].ProcessAssociationStatus -eq 'PossiblePidReuse')
+        Assert-True ($result.Processes.Items[0].AssociationStatus -eq 'PossiblePidReuse' -and $result.Processes.Items[0].CreatedAt.StartsWith('2099-01-01'))
+        Assert-True (@($script:CollectionIssues | Where-Object { $_.Code -eq 'PossiblePidReuse' }).Count -eq 1)
+        Assert-ProcessReferences $result
+        $end = '2020-01-01T00:00:01Z'
+        Assert-True ((Get-ProcessAssociationStatus ([pscustomobject]@{ CreatedAt = $end }) Returned $end) -eq 'UnconfirmedPidMatch')
+        Assert-True ((Get-ProcessAssociationStatus ([pscustomobject]@{ CreatedAt = '2020-01-01T00:00:00Z' }) Returned $end) -eq 'UnconfirmedPidMatch')
+        Assert-True ((Get-ProcessAssociationStatus ([pscustomobject]@{ CreatedAt = $null }) Returned $end) -eq 'UnconfirmedPidMatch')
+        $row.CreationDate = [datetimeoffset]::Parse('2000-01-01T02:00:00+02:00')
+        $result = Invoke-TestProcessCollection
+        Assert-True ($result.Processes.Items[0].CreatedAt.StartsWith('2000-01-01T00:00:00') -and $result.Processes.Items[0].AssociationStatus -eq 'UnconfirmedPidMatch')
+    }
+    Run-Test 'unexpected and duplicate process identities never create invalid references' {
+        $script:ProcessRows['123'] = New-FakeProcessRecord 999
+        $result = Invoke-TestProcessCollection
+        Assert-True ($result.Processes.Status -eq 'Failed' -and $null -eq $result.Processes.Count -and $result.Processes.TargetOutcomes[0].Outcome -eq 'Failed')
+        $script:ProcessRows['123'] = @((New-FakeProcessRecord 123), (New-FakeProcessRecord 123))
+        $result = Invoke-TestProcessCollection
+        Assert-True ($result.Processes.Status -eq 'Partial' -and $result.Processes.Count -eq 1)
+        Assert-ProcessReferences $result
+    }
+    Run-Test 'six reports round trip all endpoint and process records with JSON-only commands' {
+        $script:FakeEndpoints.TCP = @((New-FakeEndpointRecord 123 443), (New-FakeEndpointRecord 900 8080))
+        $location = New-TestLocation; $report = New-TestReport $location
+        Publish-InventoryReports $report $location $script:Allowed
+        $json = [IO.File]::ReadAllText((Join-Path $location.Directory 'service-software.json')) | ConvertFrom-Json
+        foreach ($pair in @(@('Services', 'services.csv'), @('InstalledSoftware', 'software.csv'), @('NetworkEndpoints', 'network-endpoints.csv'), @('Processes', 'processes.csv'))) {
+            $dataset = @($json.Collection.Datasets | Where-Object { $_.Id -eq $pair[0] })[0]
+            $csv = @(Import-Csv -LiteralPath (Join-Path $location.Directory $pair[1]))
+            Assert-True ($csv.Count -eq $dataset.Count -and $dataset.Items.Count -eq $dataset.Count)
+        }
+        $csv = @(Import-Csv -LiteralPath (Join-Path $location.Directory 'processes.csv'))
+        Assert-True ($csv[1].RelatedServiceIds -eq '[]' -and @($csv[0].SourceKinds | ConvertFrom-Json).Count -eq 2)
+        foreach ($name in @('summary.txt', 'services.csv', 'software.csv', 'network-endpoints.csv', 'processes.csv')) {
+            $text = [IO.File]::ReadAllText((Join-Path $location.Directory $name))
+            Assert-True (-not $text.Contains('SYNTHETIC_PROCESS_SECRET') -and -not $text.Contains('SYNTHETIC_SECRET_MARKER'))
+        }
+        $canonical = [IO.File]::ReadAllText((Join-Path $location.Directory 'service-software.json'))
+        Assert-True ($canonical.Contains('SYNTHETIC_PROCESS_SECRET') -and $canonical.Contains('SYNTHETIC_SECRET_MARKER'))
+        $console = Get-ServiceSoftwareSummary $report
+        Assert-True (-not $console.Contains('SYNTHETIC_PROCESS_SECRET') -and -not $console.Contains('SYNTHETIC_SECRET_MARKER'))
+    }
+    Run-Test 'process and issue preview caps do not truncate detailed reports' {
+        $script:FakeServices[0].State = 'Stopped'; $script:FakeServices[0].ProcessId = 0
+        $script:FakeEndpoints.TCP = @(foreach ($number in 1..25) { New-FakeEndpointRecord $number })
+        $location = New-TestLocation; $report = New-TestReport $location
+        $processes = @($report.Collection.Datasets | Where-Object { $_.Id -eq 'Processes' })[0]
+        Assert-True ($processes.Status -eq 'Success' -and $processes.Count -eq 25)
+        foreach ($number in 1..15) { Add-InventoryIssue Collection Processes Parse SyntheticIssue 'Synthetic issue.' }
+        foreach ($number in 1..5) { Add-InventoryIssue Output $null Verify SyntheticIssue 'Synthetic issue.' }
+        $report.Collection.Issues = @($script:CollectionIssues.ToArray()); $report.Output.Issues = @($script:OutputIssues.ToArray())
+        $console = Get-ServiceSoftwareSummary $report
+        $detailed = Get-ServiceSoftwareSummary $report -Detailed
+        Assert-True ([regex]::Matches($console, '(?m)^[0-9]+ / SyntheticProcess_').Count -eq 10)
+        Assert-True ([regex]::Matches($console, '(?m)^- SyntheticIssue:').Count -eq 10)
+        Assert-True ([regex]::Matches($detailed, '(?m)^- PID:').Count -eq 25 -and [regex]::Matches($detailed, '(?m)^- SyntheticIssue:').Count -eq 20)
+    }
+    Run-Test 'saved required success exits zero even with unavailable optional endpoints and files' {
+        function script:New-ProtectedReportLocation { param($Root,$HostFolder,$RunId,$AllowedSids); $script:LastLocation = New-TestLocation; $script:LastLocation }
+        $script:EndpointModes.TCP = 'Missing'; $script:EndpointModes.UDP = 'Missing'
+        $result = @(Invoke-ServiceSoftwareInventory $script:TestRoot)
+        Assert-True ($result[-1] -eq 0 -and $script:ProcessBatches.Count -eq 1)
+        $json = [IO.File]::ReadAllText((Join-Path $script:LastLocation.Directory 'service-software.json')) | ConvertFrom-Json
+        Assert-True ($json.Collection.Status -eq 'Success' -and $json.Output.Status -eq 'Success' -and $json.Output.Files.Count -eq 6 -and -not $json.ReleaseReady)
+        Assert-True (@($json.Collection.Issues | Where-Object { $_.Code -eq 'NotImplemented' }).Count -eq 1)
     }
     Run-Test 'native location preparation resolves relative roots and avoids collisions' {
         $base = Join-Path $script:TestRoot 'RelativeRoot'
@@ -590,7 +1079,7 @@ try {
             $first = New-ProtectedReportLocation '.' SYNTHETIC_HOST ([guid]::NewGuid().ToString()) $script:Allowed
             $second = New-ProtectedReportLocation '.' SYNTHETIC_HOST ([guid]::NewGuid().ToString()) $script:Allowed
             Assert-True ([IO.Path]::IsPathRooted($first.Directory) -and $first.Directory -ne $second.Directory)
-            Assert-True ($first.TemporaryPaths.Count -eq 4 -and $second.TemporaryPaths.Count -eq 4)
+            Assert-True ($first.TemporaryPaths.Count -eq 6 -and $second.TemporaryPaths.Count -eq 6)
         }
         finally { Pop-Location }
     }
