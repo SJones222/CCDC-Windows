@@ -91,6 +91,12 @@ class NetworkRelationshipsSourceTests(unittest.TestCase):
         self.assertIn("$offset += 32", context)
         self.assertIn("foreach ($name in @('Processes', 'Services'))", context)
 
+    def test_remote_address_membership_keeps_single_matches_in_an_array(self):
+        classifier = function("Set-ConnectionRelationships")
+        self.assertIn("$remoteMatches = @(if ($map.ContainsKey($remote.Normalized)) { $map[$remote.Normalized] })", classifier)
+        self.assertNotIn("$remoteMatches = if (", classifier)
+        self.assertIn("$remoteMatches.Count -gt 0", classifier)
+
     def test_targeted_queries_and_explicit_outcomes(self):
         query = function("Invoke-ContextBatch")
         self.assertIn("-Property ProcessId,Name,CreationDate -Filter $filter -OperationTimeoutSec 30", query)

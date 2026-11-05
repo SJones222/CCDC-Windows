@@ -435,7 +435,7 @@ function Set-ConnectionRelationships {
         if ($local.Normalized -eq $remote.Normalized) {
             $item.Relationship = 'SameHostObserved'; $item.RelationshipReason = 'EqualEndpointAddresses'; continue
         }
-        $remoteMatches = if ($map.ContainsKey($remote.Normalized)) { @($map[$remote.Normalized]) } else { @() }
+        $remoteMatches = @(if ($map.ContainsKey($remote.Normalized)) { $map[$remote.Normalized] })
         if ($remote.NeedsScope) { $remoteMatches = @($remoteMatches | Where-Object { $_.InterfaceIndex -eq $remoteZone }) }
         if ($remoteMatches.Count -gt 0) { $item.Relationship = 'SameHostObserved'; $item.RelationshipReason = 'RemoteMatchesLocalAddress'; continue }
         if ($Addresses.Status -ne 'Success') { $item.RelationshipReason = 'LocalCoverageIncomplete'; continue }

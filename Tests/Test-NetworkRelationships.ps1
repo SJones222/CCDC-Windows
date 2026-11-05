@@ -22,8 +22,11 @@ $script:TestRoot = Join-Path ([IO.Path]::GetTempPath()) ('CCDC-Relationships-Tes
 $script:Allowed = @('S-1-5-21-1-2-3-1001', 'S-1-5-18', 'S-1-5-32-544')
 
 function Assert-True {
-    param([bool]$Condition)
-    if (-not $Condition) { throw 'Synthetic assertion failed.' }
+    param([bool]$Condition, [string]$Reason)
+    if (-not $Condition) {
+        if ($Reason) { Write-Host ('  ' + $Reason) }
+        throw 'Synthetic assertion failed.'
+    }
 }
 function Assert-Throws {
     param([scriptblock]$Action)
@@ -226,7 +229,26 @@ try {
     }
     Run-Test 'different assigned IPv4 addresses are same-host evidence' {
         $script:Rows['LocalAddresses:IPv4'] += New-Address '10.0.26.157' 7 24
-        $result = Invoke-Fixture; Assert-True ($result.Datasets[0].Items[0].RelationshipReason -eq 'RemoteMatchesLocalAddress')
+        $result = Invoke-Fixture
+        $row = $result.Datasets[0].Items[0]
+        $remoteAssignments = @($result.Datasets[1].Items | Where-Object { $_.AddressNormalized -eq $row.RemoteAddressNormalized })
+        Assert-True ($result.Datasets[1].Status -eq 'Success' -and $remoteAssignments.Count -eq 1) (
+            'Expected: complete local-address coverage and one remote-address assignment. Actual: status=' + $result.Datasets[1].Status + '; assignments=' + $remoteAssignments.Count)
+        Assert-True ($row.Relationship -eq 'SameHostObserved' -and $row.RelationshipReason -eq 'RemoteMatchesLocalAddress') (
+            'Expected: SameHostObserved / RemoteMatchesLocalAddress. Actual: ' + $row.Relationship + ' / ' + $row.RelationshipReason)
+        Assert-References $result
+    }
+    Run-Test 'zero one and multiple remote local-address matches retain membership semantics' {
+        foreach ($count in @(0,1,2)) {
+            $script:Rows['LocalAddresses:IPv4'] = @((New-Address))
+            for ($index = 0; $index -lt $count; $index++) { $script:Rows['LocalAddresses:IPv4'] += New-Address '10.0.26.157' (7 + $index) 24 }
+            $result = Invoke-Fixture; $row = $result.Datasets[0].Items[0]
+            $expectedRelationship = if ($count -eq 0) { 'CrossMachineObserved' } else { 'SameHostObserved' }
+            $expectedReason = if ($count -eq 0) { 'RemoteOutsideObservedLocalSet' } else { 'RemoteMatchesLocalAddress' }
+            Assert-True ($row.Relationship -eq $expectedRelationship -and $row.RelationshipReason -eq $expectedReason) (
+                'Matches=' + $count + '; expected: ' + $expectedRelationship + ' / ' + $expectedReason + '; actual: ' + $row.Relationship + ' / ' + $row.RelationshipReason)
+            Assert-References $result
+        }
     }
     Run-Test 'mapped IPv4 compares numerically without altering raw strings' {
         $script:Rows['TCPConnections:EstablishedTCP'] = @((New-Connection 123 '::ffff:10.0.26.141' '::ffff:10.0.26.157'))
