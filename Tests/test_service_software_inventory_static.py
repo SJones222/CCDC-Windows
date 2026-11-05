@@ -35,6 +35,19 @@ class FoundationSourceTests(unittest.TestCase):
         self.assertNotRegex(SOURCE, r"-(?:ComputerName|CimSession)\b")
         self.assertEqual(SOURCE.count("Get-CimInstance -ClassName"), 1)
 
+    def test_service_account_null_requires_a_present_property_and_successful_read(self):
+        converter = function("Convert-ServiceRecord")
+        self.assertIn("$property = $Source.PSObject.Properties[$mapping[$field]]", converter)
+        self.assertIn("[System.Management.Automation.PSPropertyInfo].GetProperty('Value')", converter)
+        self.assertLess(converter.index("throw 'ServicePropertyMissing'"), converter.index("$value = $valueProperty.GetValue($property, $null)"))
+        self.assertLess(converter.index("$value = $valueProperty.GetValue($property, $null)"), converter.index("if ($null -eq $value)"))
+        self.assertIn("if ($field -eq 'ServiceAccount') { continue }", converter)
+        self.assertIn("throw 'ServiceFieldUnavailable'", converter)
+        self.assertIn("$value -isnot [string]", converter)
+        self.assertIn("$value.GetType() -notin", converter)
+        self.assertIn("[uint32]$value", converter)
+        self.assertNotIn("[string]$value", converter)
+
     def test_registry_is_machine_only_and_both_explicit_views(self):
         self.assertIn("@('Registry64', 'Registry32')", SOURCE)
         self.assertIn("[Microsoft.Win32.RegistryHive]::LocalMachine", SOURCE)

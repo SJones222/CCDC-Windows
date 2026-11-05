@@ -90,8 +90,12 @@ function New-InventoryDataset {
 
 function Convert-ServiceRecord {
     param($Source)
-    $name = [string]$Source.Name
-    if ([string]::IsNullOrWhiteSpace($name)) { throw 'ServiceIdentityMissing' }
+    # Invoke the getter as a .NET method so a failed read cannot masquerade as null.
+    $valueProperty = [System.Management.Automation.PSPropertyInfo].GetProperty('Value')
+    $nameProperty = $Source.PSObject.Properties['Name']
+    if ($null -eq $nameProperty) { throw 'ServiceIdentityMissing' }
+    $name = $valueProperty.GetValue($nameProperty, $null)
+    if ($name -isnot [string] -or [string]::IsNullOrWhiteSpace($name)) { throw 'ServiceIdentityMissing' }
     $item = [ordered]@{
         Id = 'service:' + $name; Name = $name; DisplayName = $null; State = $null
         StartMode = $null; ServiceAccount = $null; ProcessId = $null
@@ -106,10 +110,24 @@ function Convert-ServiceRecord {
     }
     foreach ($field in $mapping.Keys) {
         try {
-            $value = $Source.($mapping[$field])
-            if ($null -eq $value) { throw 'ServiceFieldUnavailable' }
-            if ($field -eq 'ProcessId') { $item[$field] = [uint32]$value }
-            else { $item[$field] = [string]$value }
+            $property = $Source.PSObject.Properties[$mapping[$field]]
+            if ($null -eq $property) { throw 'ServicePropertyMissing' }
+            $value = $valueProperty.GetValue($property, $null)
+            if ($null -eq $value) {
+                # StartName is legitimately nullable; a missing or failed read is not.
+                if ($field -eq 'ServiceAccount') { continue }
+                throw 'ServiceFieldUnavailable'
+            }
+            if ($field -eq 'ProcessId') {
+                if ($value.GetType() -notin @([byte], [sbyte], [int16], [uint16], [int32], [uint32], [int64], [uint64])) {
+                    throw 'ServiceFieldTypeInvalid'
+                }
+                $item[$field] = [uint32]$value
+            }
+            else {
+                if ($value -isnot [string]) { throw 'ServiceFieldTypeInvalid' }
+                $item[$field] = $value
+            }
         }
         catch {
             $item.RecordStatus = 'Partial'

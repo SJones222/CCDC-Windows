@@ -206,6 +206,7 @@ try {
         Assert-True ($data.Status -eq 'Success' -and $data.Count -eq 0 -and $data.Items.Count -eq 0)
     }
     Run-Test 'denied, genuine failure, and late partial service queries' {
+        $script:FakeServices[0].StartName = $null
         foreach ($mode in @('Denied', 'Missing', 'Failed', 'AfterOne')) {
             $script:CimMode = $mode
             $data = Get-ServiceDataset
@@ -215,7 +216,9 @@ try {
             $codeByMode = @{ Denied = 'AccessDenied'; Missing = 'CapabilityMissing'; Failed = 'QueryFailed'; AfterOne = 'QueryFailed' }
             Assert-True ($script:CollectionIssues[$script:CollectionIssues.Count - 1].Code -eq $codeByMode[$mode])
             if ($mode -ne 'AfterOne') { Assert-True ($null -eq $data.Count) }
+            else { Assert-True ($data.Count -eq 1 -and $data.Items[0].RecordStatus -eq 'Success' -and $null -eq $data.Items[0].ServiceAccount) }
         }
+        Assert-True (@($script:CollectionIssues | Where-Object { $_.Code -eq 'RecordReadFailed' }).Count -eq 0)
     }
     Run-Test 'wrapped exception and CIM error identities use stable codes' {
         $denial = [InvalidOperationException]::new('Synthetic wrapper', [UnauthorizedAccessException]::new('Synthetic secret'))
@@ -230,12 +233,87 @@ try {
             Assert-True ($problem.Status -eq 'Unavailable' -and $problem.Code -eq $expected)
         }
     }
-    Run-Test 'missing service field is partial, empty command is not unknown' {
-        $script:FakeServices[0].PathName = ''
+    Run-Test 'nullable service account is successful, empty command is not unknown' {
         $script:FakeServices[0].StartName = $null
+        foreach ($command in @($script:FakeServices[0].PathName, '')) {
+            $script:FakeServices[0].PathName = $command
+            $data = Get-ServiceDataset
+            Assert-True ($data.Status -eq 'Success' -and $data.Count -eq 1 -and $data.Items[0].RecordStatus -eq 'Success')
+            Assert-True ($null -eq $data.Items[0].ServiceAccount -and $script:CollectionIssues.Count -eq 0)
+            $expected = if ($command -ceq '') { 'Empty' } else { 'Collected' }
+            Assert-True ($data.Items[0].RawCommandLineState -eq $expected -and $data.Items[0].RawCommandLine -ceq $command)
+        }
+    }
+    Run-Test 'missing properties and other required null metadata remain partial' {
+        $original = $script:FakeServices[0]
+        foreach ($mode in @('Missing', 'Null')) {
+            foreach ($field in @('DisplayName', 'State', 'StartMode', 'StartName', 'ProcessId', 'PathName')) {
+                if ($mode -eq 'Null' -and $field -eq 'StartName') { continue }
+                $row = $original.PSObject.Copy()
+                if ($mode -eq 'Missing') { $row.PSObject.Properties.Remove($field) }
+                else { $row.$field = $null }
+                $script:FakeServices = @($row)
+                $before = $script:CollectionIssues.Count
+                $data = Get-ServiceDataset
+                Assert-True ($data.Status -eq 'Partial' -and $data.Count -eq 1 -and $data.Items[0].RecordStatus -eq 'Partial')
+                Assert-True ($script:CollectionIssues.Count -eq $before + 1)
+                $issue = $script:CollectionIssues[$before]
+                Assert-True ($issue.Code -eq 'RecordReadFailed' -and $issue.DatasetId -eq 'Services' -and $issue.Stage -eq 'Parse')
+                if ($field -eq 'PathName') {
+                    Assert-True ($null -eq $data.Items[0].RawCommandLine -and $data.Items[0].RawCommandLineState -eq 'Unavailable')
+                }
+            }
+        }
+    }
+    Run-Test 'unreadable account and required properties remain partial with access issues' {
+        $ErrorActionPreference = 'Continue'
+        $original = $script:FakeServices[0]
+        foreach ($field in @('StartName', 'State')) {
+            $row = $original.PSObject.Copy()
+            $row | Add-Member -MemberType ScriptProperty -Name $field -Value { throw [UnauthorizedAccessException]::new('Synthetic denial') } -Force
+            $script:FakeServices = @($row)
+            $before = $script:CollectionIssues.Count
+            $data = Get-ServiceDataset
+            Assert-True ($data.Status -eq 'Partial' -and $data.Count -eq 1 -and $data.Items[0].RecordStatus -eq 'Partial')
+            Assert-True ($script:CollectionIssues.Count -eq $before + 1 -and $script:CollectionIssues[$before].Code -eq 'AccessDenied')
+            Assert-True (-not $script:CollectionIssues[$before].Message.Contains('Synthetic denial'))
+        }
+    }
+    Run-Test 'invalid service field types are not silently coerced' {
+        $original = $script:FakeServices[0]
+        foreach ($fixture in @(
+            @{ Field = 'DisplayName'; Value = 123 }, @{ Field = 'StartName'; Value = 123 },
+            @{ Field = 'PathName'; Value = @('one', 'two') }, @{ Field = 'ProcessId'; Value = '123' },
+            @{ Field = 'ProcessId'; Value = $true }, @{ Field = 'ProcessId'; Value = 1.5 },
+            @{ Field = 'ProcessId'; Value = -1 }, @{ Field = 'ProcessId'; Value = [uint64]::MaxValue }
+        )) {
+            $row = $original.PSObject.Copy()
+            $row.($fixture.Field) = $fixture.Value
+            $script:FakeServices = @($row)
+            $before = $script:CollectionIssues.Count
+            $data = Get-ServiceDataset
+            Assert-True ($data.Status -eq 'Partial' -and $data.Count -eq 1)
+            Assert-True ($script:CollectionIssues.Count -eq $before + 1 -and $script:CollectionIssues[$before].Code -eq 'RecordReadFailed')
+        }
+        $row = $original.PSObject.Copy(); $row.Name = 123
+        $script:FakeServices = @($row)
         $data = Get-ServiceDataset
-        Assert-True ($data.Status -eq 'Partial' -and $data.Items[0].RawCommandLineState -eq 'Empty')
-        Assert-True ($data.Items[0].RawCommandLine -ceq '')
+        Assert-True ($data.Status -eq 'Failed' -and $null -eq $data.Count -and $data.Items.Count -eq 0)
+    }
+    Run-Test 'nullable service account survives report serialization and count checks' {
+        $script:FakeServices[0].StartName = $null
+        $second = $script:FakeServices[0].PSObject.Copy()
+        $second.Name = 'SecondSyntheticService'; $second.StartName = 'LocalSystem'
+        $script:FakeServices += $second
+        $location = New-TestLocation; $report = New-TestReport $location
+        Publish-InventoryReports $report $location $script:Allowed
+        $json = [IO.File]::ReadAllText((Join-Path $location.Directory 'service-software.json')) | ConvertFrom-Json
+        $services = @($json.Collection.Datasets | Where-Object { $_.Id -eq 'Services' })[0]
+        $csv = @(Import-Csv -LiteralPath (Join-Path $location.Directory 'services.csv'))
+        Assert-True ($services.Status -eq 'Success' -and $services.Count -eq 2 -and $services.Items.Count -eq 2 -and $csv.Count -eq 2)
+        Assert-True ($null -eq $services.Items[0].ServiceAccount -and [string]::IsNullOrEmpty($csv[0].ServiceAccount))
+        Assert-True ($services.Items[1].ServiceAccount -eq 'LocalSystem' -and $csv[1].ServiceAccount -eq 'LocalSystem')
+        Assert-True (@($json.Collection.Issues).Count -eq 0 -and $report.Output.Status -eq 'Success')
     }
     Run-Test 'both software views preserve duplicates and missing values' {
         foreach ($view in @('Registry64', 'Registry32')) {
