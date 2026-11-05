@@ -1,7 +1,7 @@
 #requires -Version 5.1
 <#
 .SYNOPSIS
-    Dependency-free synthetic tests for Milestone 1.2B. Run in Windows PowerShell 5.1.
+    Dependency-free synthetic tests for Milestone 1.2C. Run in Windows PowerShell 5.1.
 .DESCRIPTION
     Loads function ASTs only, never the collector's entry point. CIM, registry roots,
     and filesystem ACL probes are mocked. Writes synthetic reports to its own temp
@@ -80,6 +80,71 @@ function Invoke-TestProcessCollection {
     [pscustomobject]@{ Services = $services; Endpoints = $endpoints; Processes = $processes; Budget = $budget }
 }
 
+function Invoke-TestFileCollection {
+    param([bool]$Supported = $true)
+    $script:FileHostSupported = $Supported
+    if (-not $script:ProcessRows.ContainsKey('123')) {
+        $process = New-FakeProcessRecord 123
+        $process.ExecutablePath = 'C:\Fixture\Service.exe'
+        $script:ProcessRows['123'] = $process
+    }
+    $result = Invoke-TestProcessCollection
+    $files = Get-ExecutableDataset $result.Services $result.Processes $result.Budget
+    $result | Add-Member -NotePropertyName Files -NotePropertyValue $files
+    $result
+}
+
+function New-VirtualExecutableStream {
+    param([string]$Path, [long]$Length, [byte[]]$Payload)
+    $stream = [pscustomobject]@{ Path = $Path; Length = $Length; Position = [long]0; Payload = $Payload; Calls = 0; Disposed = $false }
+    $stream | Add-Member ScriptMethod Read {
+        param([byte[]]$Buffer, [int]$Offset, [int]$Count)
+        $this.Calls++
+        if ($script:ReadFailures.ContainsKey($this.Path) -and $this.Calls -ge $script:ReadFailures[$this.Path]) {
+            $advance = [Math]::Min([long]$script:AdvanceBeforeReadFailure, [Math]::Min([long]$Count, $this.Length - $this.Position))
+            $this.Position += $advance; $script:ObservedReadBytes += $advance
+            throw [IO.IOException]::new('Synthetic read failure')
+        }
+        $countRead = [int][Math]::Min([long]$Count, $this.Length - $this.Position)
+        if ($this.Payload.Length -gt 0) { [array]::Copy($this.Payload, [int]$this.Position, $Buffer, $Offset, $countRead) }
+        else { [array]::Clear($Buffer, $Offset, $countRead) }
+        $this.Position += $countRead; $script:ObservedReadBytes += $countRead
+        if ($Count -gt $script:MaxReadRequest) { $script:MaxReadRequest = $Count }
+        if ($script:StopAfterRead) { $script:FileElapsed = 60 }
+        if ($script:GrowAfterRead) { $this.Length++ }
+        if ($script:MutateAfterRead) { $script:ChangedFacts[$this.Path] = 1 }
+        return $countRead
+    }
+    $stream | Add-Member ScriptMethod Dispose {
+        $this.Disposed = $true; $script:DisposedStreams++
+        if ($script:FailStreamDispose) { throw [IO.IOException]::new('Synthetic disposal failure') }
+    }
+    $stream
+}
+
+function Assert-FileReferences {
+    param($Result)
+    $ids = @($Result.Files.Items | ForEach-Object { $_.Id })
+    Assert-True (@($ids | Select-Object -Unique).Count -eq $ids.Count)
+    foreach ($source in @($Result.Services.Items) + @($Result.Processes.Items)) {
+        if ($source.FileRecordId) { Assert-True ($ids -contains $source.FileRecordId) }
+    }
+    foreach ($file in $Result.Files.Items) {
+        Assert-True ($file.SignatureMode -eq 'NotInvoked' -and $file.SignatureStatus -eq 'Skipped' -and $null -eq $file.SignerSubject)
+        foreach ($reference in $file.SourceRefs) {
+            $records = if ($reference.DatasetId -eq 'Services') { $Result.Services.Items } else { $Result.Processes.Items }
+            $source = @($records | Where-Object { $_.Id -eq $reference.RecordId })[0]
+            Assert-True ($null -ne $source -and $source.FileRecordId -eq $file.Id)
+        }
+    }
+    foreach ($name in @('Files', 'Hashes', 'Signatures')) {
+        $usage = $Result.Budget[$name]
+        if ($null -ne $usage.CandidateCount) { Assert-True ($usage.CandidateCount -eq $usage.AttemptedCount + $usage.SkippedCount) }
+        Assert-True ($usage.AttemptedCount -eq $usage.CompletedCount + $usage.UnusableCount)
+    }
+    Assert-True ($Result.Budget.HashBytesRead -le 536870912 -and $script:SignatureCalls -eq 0)
+}
+
 function Assert-ProcessReferences {
     param($Result)
     Assert-True ((Get-AggregateStatus $Result.Processes.Coverage) -eq $Result.Processes.Status)
@@ -131,6 +196,67 @@ function Reset-Fixture {
     $script:EndpointModes = @{ TCP = 'Success'; UDP = 'Success' }
     $script:EndpointCalls = @{ TCP = 0; UDP = 0 }
     $script:FakeEndpoints = @{ TCP = @(); UDP = @() }
+    $script:FileHostSupported = $false; $script:FileElapsed = 0; $script:ClockCalls = 0; $script:ExpireClockAt = 0
+    $script:FileStates = @{}; $script:FileFacts = @{}; $script:FactCalls = @{}; $script:ChangedFacts = @{}
+    $script:FilePayloads = @{}; $script:VersionFailures = @{}; $script:ReadFailures = @{}; $script:OpenFailures = @{}
+    $script:AttributeCalls = New-Object 'System.Collections.Generic.List[string]'
+    $script:ContentCalls = New-Object 'System.Collections.Generic.List[string]'
+    $script:StopAfterRead = $false; $script:GrowAfterRead = $false; $script:MutateAfterRead = $false
+    $script:AdvanceBeforeReadFailure = 0; $script:FailStreamDispose = $false
+    $script:ObservedReadBytes = [long]0; $script:MaxReadRequest = 0; $script:DisposedStreams = 0; $script:SignatureCalls = 0
+    function script:Test-FileEnrichmentHost { $script:FileHostSupported }
+    function script:Get-WindowsDirectory { 'C:\Windows' }
+    function script:Get-ExecutableDriveType {
+        param($Root)
+        if ($Root -eq 'Z:\') { return [IO.DriveType]::Network }
+        [IO.DriveType]::Fixed
+    }
+    function script:Get-ExecutableAttributes {
+        param($Path)
+        $script:AttributeCalls.Add($Path)
+        switch ($script:FileStates[$Path]) {
+            'Missing' { throw [IO.FileNotFoundException]::new('Synthetic missing file') }
+            'Denied' { throw [UnauthorizedAccessException]::new('Synthetic file denial') }
+            'Failed' { throw [IO.IOException]::new('Synthetic filesystem failure') }
+            'Reparse' { return [IO.FileAttributes]([int][IO.FileAttributes]::Directory -bor [int][IO.FileAttributes]::ReparsePoint) }
+            'Directory' { return [IO.FileAttributes]::Directory }
+        }
+        if ($Path -match '\.[^\\]+$') { return [IO.FileAttributes]::Normal }
+        [IO.FileAttributes]::Directory
+    }
+    function script:Get-ExecutableFacts {
+        param($Path)
+        $script:ContentCalls.Add('Facts:' + $Path)
+        if (-not $script:FactCalls.ContainsKey($Path)) { $script:FactCalls[$Path] = 0 }
+        $script:FactCalls[$Path]++
+        $facts = if ($script:FileFacts.ContainsKey($Path)) { $script:FileFacts[$Path].PSObject.Copy() }
+            else { [pscustomobject]@{ LengthBytes = [long]3; LastWriteTimeUtc = '2000-01-01T00:00:00.0000000Z' } }
+        if ($script:ChangedFacts.ContainsKey($Path) -and $script:FactCalls[$Path] -ge $script:ChangedFacts[$Path]) {
+            $facts.LastWriteTimeUtc = '2001-01-01T00:00:00.0000000Z'
+        }
+        $facts
+    }
+    function script:Get-ExecutableVersion {
+        param($Path)
+        $script:ContentCalls.Add('Version:' + $Path)
+        if ($script:VersionFailures.ContainsKey($Path)) { throw [UnauthorizedAccessException]::new('Synthetic version denial') }
+        [pscustomobject]@{ FileVersion = $null; ProductVersion = $null; CompanyName = $null; ProductName = $null }
+    }
+    function script:Open-ExecutableStream {
+        param($Path)
+        $script:ContentCalls.Add('Stream:' + $Path)
+        if ($script:OpenFailures.ContainsKey($Path)) { throw [UnauthorizedAccessException]::new('Synthetic stream denial') }
+        $length = if ($script:FileFacts.ContainsKey($Path)) { $script:FileFacts[$Path].LengthBytes } else { 3 }
+        $payload = if ($script:FilePayloads.ContainsKey($Path)) { $script:FilePayloads[$Path] } else { [Text.Encoding]::UTF8.GetBytes('abc') }
+        New-VirtualExecutableStream $Path $length $payload
+    }
+    function script:Get-FilePhaseElapsedSeconds {
+        param($Clock)
+        $script:ClockCalls++
+        if ($script:ExpireClockAt -gt 0 -and $script:ClockCalls -ge $script:ExpireClockAt) { $script:FileElapsed = 60 }
+        $script:FileElapsed
+    }
+    function script:Get-AuthenticodeSignature { $script:SignatureCalls++; throw 'Signature verification is prohibited.' }
     function script:Get-CimInstance {
         [CmdletBinding()]
         param([string]$ClassName, [string[]]$Property, [int]$OperationTimeoutSec, [string]$Filter)
@@ -245,7 +371,7 @@ function New-TestLocation {
         Directory = $directory; TemporaryPaths = [ordered]@{}
         CreatedPaths = (New-Object 'System.Collections.Generic.List[string]')
     }
-    foreach ($name in @('summary.txt', 'services.csv', 'software.csv', 'network-endpoints.csv', 'processes.csv', 'service-software.json')) {
+    foreach ($name in @('summary.txt', 'services.csv', 'software.csv', 'network-endpoints.csv', 'processes.csv', 'files.csv', 'service-software.json')) {
         $path = Join-Path $directory ($name + '.tmp')
         [IO.File]::Open($path, [IO.FileMode]::CreateNew).Dispose()
         $location.TemporaryPaths[$name] = $path
@@ -255,17 +381,22 @@ function New-TestLocation {
 }
 
 function New-TestReport {
-    param($Location)
+    param($Location, [switch]$IncludeFiles)
     $services = Get-ServiceDataset
     $software = Get-SoftwareDataset
     $endpoints = Get-EndpointDataset
     $budget = [ordered]@{}
     $processes = Get-ProcessDataset $services $endpoints $budget
-    $files = New-InventoryDataset ExecutableFiles $false Unavailable @() @('NotImplemented')
+    foreach ($name in @('Files', 'Hashes', 'Signatures')) {
+        $budget[$name] = [ordered]@{ CandidateCount = $null; AttemptedCount = 0; CompletedCount = 0; UnusableCount = 0; SkippedCount = 0 }
+    }
+    $budget.HashBytesRead = 0; $budget.FilePhaseElapsedSeconds = 0
+    $files = if ($IncludeFiles) { Get-ExecutableDataset $services $processes $budget }
+        else { New-InventoryDataset ExecutableFiles $false Unavailable @() @('Synthetic file data is not supplied for legacy publication fixtures.') }
     $datasets = @($services, $software, $endpoints, $processes, $files)
     [ordered]@{
         SchemaVersion = '0.1.0'; ModuleId = 'service-software-inventory'; Version = '0.1.0'
-        DevelopmentStage = 'Milestone 1.2B'; ReleaseReady = $false
+        DevelopmentStage = 'Milestone 1.2C'; ReleaseReady = $false
         RunId = [guid]::NewGuid().ToString(); Hostname = 'SYNTHETIC_HOST'
         StartedAt = [datetime]::UtcNow.ToString('o'); CompletedAt = [datetime]::UtcNow.ToString('o')
         Collection = [ordered]@{ Status = Get-AggregateStatus $datasets; Datasets = $datasets; Issues = @($script:CollectionIssues.ToArray()); BudgetUsage = $budget }
@@ -273,7 +404,7 @@ function New-TestReport {
         Output = [ordered]@{
             Status = 'Failed'; Directory = $Location.Directory; FallbackUsed = $false
             ProtectionStatus = 'VerifiedRestricted'
-            Files = @('summary.txt', 'services.csv', 'software.csv', 'network-endpoints.csv', 'processes.csv', 'service-software.json'); Issues = @()
+            Files = @('summary.txt', 'services.csv', 'software.csv', 'network-endpoints.csv', 'processes.csv', 'files.csv', 'service-software.json'); Issues = @()
         }
     }
 }
@@ -609,7 +740,7 @@ try {
             Assert-True ($script:PublishingReport.Output.Status -eq 'Failed')
             $script:WrittenNames.Add([IO.Path]::GetFileName($Path))
             if ([IO.Path]::GetFileName($Path) -eq 'service-software.json.tmp') {
-                foreach ($name in @('summary.txt', 'services.csv', 'software.csv', 'network-endpoints.csv', 'processes.csv')) {
+                foreach ($name in @('summary.txt', 'services.csv', 'software.csv', 'network-endpoints.csv', 'processes.csv', 'files.csv')) {
                     Assert-True ([IO.File]::Exists((Join-Path ([IO.Path]::GetDirectoryName($Path)) $name)))
                 }
                 Assert-True (($Text | ConvertFrom-Json).Output.Status -eq 'Success')
@@ -622,7 +753,7 @@ try {
         $script:CandidateChecked = $false
         Assert-Throws { Publish-InventoryReports $script:PublishingReport $location $script:Allowed }
         Assert-True ($script:PublishingReport.Output.Status -eq 'Failed' -and $script:CandidateChecked)
-        Assert-True (($script:WrittenNames.ToArray() -join ',') -eq 'summary.txt.tmp,services.csv.tmp,software.csv.tmp,network-endpoints.csv.tmp,processes.csv.tmp,service-software.json.tmp')
+        Assert-True (($script:WrittenNames.ToArray() -join ',') -eq 'summary.txt.tmp,services.csv.tmp,software.csv.tmp,network-endpoints.csv.tmp,processes.csv.tmp,files.csv.tmp,service-software.json.tmp')
     }
     Run-Test 'post-promotion failure retains failed status and cleans canonical JSON first' {
         function script:Assert-ProtectedReportPath {
@@ -672,7 +803,7 @@ try {
         $processes = @($report.Collection.Datasets | Where-Object { $_.Id -eq 'Processes' })[0]
         Assert-True ($processes.Required -and $processes.Status -eq 'Unavailable' -and $null -eq $processes.Count)
         Assert-True ($report.Output.FallbackUsed -and -not $report.ReleaseReady)
-        Assert-True ($report.Output.Files.Count -eq 6)
+        Assert-True ($report.Output.Files.Count -eq 7)
         $files = @($report.Collection.Datasets | Where-Object { $_.Id -eq 'ExecutableFiles' })[0]
         Assert-True ($files.Status -eq 'Unavailable' -and $null -eq $files.Count)
     }
@@ -1074,8 +1205,367 @@ try {
         $result = @(Invoke-ServiceSoftwareInventory $script:TestRoot)
         Assert-True ($result[-1] -eq 0 -and $script:ProcessBatches.Count -eq 1)
         $json = [IO.File]::ReadAllText((Join-Path $script:LastLocation.Directory 'service-software.json')) | ConvertFrom-Json
-        Assert-True ($json.Collection.Status -eq 'Success' -and $json.Output.Status -eq 'Success' -and $json.Output.Files.Count -eq 6 -and -not $json.ReleaseReady)
-        Assert-True (@($json.Collection.Issues | Where-Object { $_.Code -eq 'NotImplemented' }).Count -eq 1)
+        Assert-True ($json.Collection.Status -eq 'Success' -and $json.Output.Status -eq 'Success' -and $json.Output.Files.Count -eq 7 -and -not $json.ReleaseReady)
+        Assert-True (@($json.Collection.Issues | Where-Object { $_.DatasetId -eq 'ExecutableFiles' -and $_.Code -eq 'CapabilityMissing' }).Count -eq 1)
+    }
+    Run-Test 'configured paths use conservative quoted or explicit unquoted executable boundaries' {
+        Assert-True ((Resolve-ConfiguredExecutablePath '"C:\Program Files\App\svc.exe" -k value') -eq 'C:\Program Files\App\svc.exe')
+        Assert-True ((Resolve-ConfiguredExecutablePath 'C:\Fixture\svc.exe -k value') -eq 'C:\Fixture\svc.exe')
+        foreach ($text in @('C:\Program Files\App\svc.exe -k x', '"C:\Fixture\svc.exe', '"C:\Fixture\svc.exe"tail', 'svc.exe -k x', 'C:\Fixture\extensionless -k x', '"C:\Fixture\svc.exe --argument value"', '"C:\Fixture\extensionless"')) {
+            $token = Resolve-ConfiguredExecutablePath $text
+            $path = ConvertTo-ExecutablePath $token
+            Assert-True ($null -eq $path.Path)
+        }
+        Assert-True ($script:ContentCalls.Count -eq 0)
+    }
+    Run-Test 'only Windows system-root aliases expand and unsafe lexical paths never access content' {
+        foreach ($path in @('%SystemRoot%\System32\svc.exe', '%windir%\System32\svc.exe', '\SystemRoot\System32\svc.exe')) {
+            Assert-True ((ConvertTo-ExecutablePath $path).Path -eq 'C:\Windows\System32\svc.exe')
+        }
+        foreach ($path in @('%USERPROFILE%\svc.exe', 'C:relative.exe', '\\server\share\svc.exe', '\\?\C:\svc.exe', '\Device\Volume\svc.exe', 'C:\Fixture\svc.exe:stream', 'C:\Fixture\NUL.exe', 'C:\Fixture\svc.exe.', 'C:\Redirect\..\svc.exe')) {
+            Assert-True ($null -eq (ConvertTo-ExecutablePath $path).Path)
+        }
+        Assert-True ($script:AttributeCalls.Count -eq 0 -and $script:ContentCalls.Count -eq 0)
+    }
+    Run-Test 'network drives and reparse components are excluded before any content reads' {
+        $script:FakeServices[0].PathName = 'Z:\Svc.exe'
+        $row = New-FakeProcessRecord 123; $row.ExecutablePath = 'C:\Redirect\Svc.exe'
+        $script:ProcessRows['123'] = $row; $script:FileStates['C:\Redirect'] = 'Reparse'
+        $result = Invoke-TestFileCollection
+        Assert-True ($result.Files.Status -eq 'Unavailable' -and $null -eq $result.Files.Count)
+        Assert-True ($script:ContentCalls.Count -eq 0 -and -not ($script:AttributeCalls -contains 'Z:\'))
+        Assert-True (-not ($script:AttributeCalls -contains 'C:\Redirect\Svc.exe'))
+        Assert-True (@($script:CollectionIssues | Where-Object { $_.Code -eq 'RemotePathSkipped' }).Count -eq 1)
+        Assert-True (@($script:CollectionIssues | Where-Object { $_.Code -eq 'ReparsePointSkipped' }).Count -eq 1)
+        Assert-FileReferences $result
+    }
+    Run-Test 'all service states resolve configured paths without replacing ambiguous configuration with process paths' {
+        $stopped = $script:FakeServices[0].PSObject.Copy(); $stopped.Name = 'Stopped'; $stopped.State = 'Stopped'; $stopped.StartMode = 'Disabled'; $stopped.ProcessId = 0
+        $stopped.PathName = '"C:\Other App\Stopped.exe" -x'
+        $script:FakeServices[0].PathName = 'C:\Program Files\Ambiguous\Svc.exe -x'
+        $script:FakeServices += $stopped
+        $row = New-FakeProcessRecord 123; $row.ExecutablePath = 'C:\Observed\Process.exe'; $script:ProcessRows['123'] = $row
+        $result = Invoke-TestFileCollection
+        Assert-True ($result.Services.Status -eq 'Success' -and $result.Services.Count -eq 2)
+        Assert-True ($result.Services.Items[0].PathResolution -eq 'Unresolved' -and $null -eq $result.Services.Items[0].ExecutablePath -and $null -eq $result.Services.Items[0].FileRecordId)
+        Assert-True ($result.Services.Items[1].PathResolution -eq 'Resolved' -and $result.Services.Items[1].ExecutablePath -eq 'C:\Other App\Stopped.exe')
+        Assert-True ($result.Processes.Items[0].ExecutablePath -eq 'C:\Observed\Process.exe' -and $result.Processes.Items[0].FileRecordId)
+        Assert-True ($null -eq $result.Budget.Files.CandidateCount)
+        Assert-FileReferences $result
+    }
+    Run-Test 'shared case-insensitive file candidates preserve every source reference and hash once' {
+        $second = $script:FakeServices[0].PSObject.Copy(); $second.Name = 'Shared'; $second.PathName = 'c:\fixture\SERVICE.exe'
+        $script:FakeServices += $second
+        $result = Invoke-TestFileCollection
+        Assert-True ($result.Files.Count -eq 1 -and $result.Files.Items[0].SourceRefs.Count -eq 3)
+        Assert-True ($result.Budget.Files.CandidateCount -eq 1 -and $result.Budget.Hashes.AttemptedCount -eq 1)
+        Assert-True ($result.Files.Items[0].SHA256 -eq 'BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD')
+        Assert-True ($result.Files.Items[0].MetadataStatus -eq 'Collected' -and $null -eq $result.Files.Items[0].FileVersion)
+        Assert-True ($script:ObservedReadBytes -eq 3 -and $script:DisposedStreams -eq 1)
+        Assert-FileReferences $result
+    }
+    Run-Test 'zero-byte files produce the complete standard SHA256 without consuming read bytes' {
+        $script:FileFacts['C:\Fixture\Service.exe'] = [pscustomobject]@{ LengthBytes = [long]0; LastWriteTimeUtc = '2000-01-01T00:00:00.0000000Z' }
+        $script:FilePayloads['C:\Fixture\Service.exe'] = [byte[]]@()
+        $result = Invoke-TestFileCollection
+        Assert-True ($result.Files.Items[0].SHA256 -eq 'E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855')
+        Assert-True ($result.Files.Items[0].HashStatus -eq 'Collected' -and $result.Budget.HashBytesRead -eq 0)
+        Assert-FileReferences $result
+    }
+    Run-Test 'known missing files are negative facts while denied and failed paths remain unavailable or failed' {
+        $path = 'C:\Fixture\Service.exe'
+        foreach ($state in @('Missing', 'Denied', 'Failed')) {
+            $script:FileStates[$path] = $state
+            $result = Invoke-TestFileCollection
+            if ($state -eq 'Missing') {
+                Assert-True ($result.Files.Count -eq 1 -and $result.Files.Items[0].FileState -eq 'Missing' -and $result.Files.Items[0].MetadataStatus -eq 'Collected')
+                Assert-True ($result.Budget.Files.CompletedCount -eq 1 -and $result.Budget.Hashes.SkippedCount -eq 1)
+                Assert-True ($null -eq $result.Files.Items[0].SHA256)
+            }
+            else {
+                $expected = if ($state -eq 'Denied') { 'Unavailable' } else { 'Failed' }
+                Assert-True ($result.Files.Status -eq $expected -and $null -eq $result.Files.Count -and $null -eq $result.Services.Items[0].FileRecordId)
+            }
+            Assert-FileReferences $result
+        }
+    }
+    Run-Test 'available version-resource strings are preserved as unverified metadata' {
+        function script:Get-ExecutableVersion {
+            param($Path)
+            [pscustomobject]@{ FileVersion = '1.2.3'; ProductVersion = '4.5'; CompanyName = 'Synthetic company'; ProductName = 'Synthetic product' }
+        }
+        $result = Invoke-TestFileCollection
+        $row = $result.Files.Items[0]
+        Assert-True ($row.MetadataStatus -eq 'Collected' -and $row.FileVersion -eq '1.2.3' -and $row.ProductVersion -eq '4.5')
+        Assert-True ($row.CompanyName -eq 'Synthetic company' -and $row.ProductName -eq 'Synthetic product' -and $row.SignatureStatus -eq 'Skipped')
+        Assert-FileReferences $result
+    }
+    Run-Test 'version-resource access failures retain usable file facts without inventing version or hash values' {
+        $script:VersionFailures['C:\Fixture\Service.exe'] = $true
+        $result = Invoke-TestFileCollection
+        $row = $result.Files.Items[0]
+        Assert-True ($result.Files.Status -eq 'Partial' -and $row.FileState -eq 'Present' -and $row.LengthBytes -eq 3)
+        Assert-True ($row.MetadataStatus -eq 'Unavailable' -and $null -eq $row.FileVersion -and $null -eq $row.SHA256)
+        Assert-True (@($script:CollectionIssues | Where-Object { $_.Code -eq 'AccessDenied' -and $_.DatasetId -eq 'ExecutableFiles' }).Count -ge 1)
+        Assert-FileReferences $result
+    }
+    Run-Test 'metadata and hash snapshots detect changed files and discard all affected digests' {
+        foreach ($threshold in @(2, 3, 4)) {
+            $script:FactCalls.Clear(); $script:ChangedFacts['C:\Fixture\Service.exe'] = $threshold
+            $result = Invoke-TestFileCollection
+            Assert-True ($null -eq $result.Files.Items[0].SHA256 -and $result.Files.Items[0].HashStatus -ne 'Collected')
+            Assert-True (@($script:CollectionIssues | Where-Object { $_.Code -eq 'FileChanged' }).Count -gt 0)
+            Assert-FileReferences $result
+        }
+    }
+    Run-Test 'stream growth and failed reads never publish partial hashes and count consumed bytes' {
+        $script:GrowAfterRead = $true
+        $result = Invoke-TestFileCollection
+        Assert-True ($null -eq $result.Files.Items[0].SHA256 -and $result.Budget.Hashes.UnusableCount -eq 1 -and $result.Budget.HashBytesRead -eq 3)
+        $script:GrowAfterRead = $false; $script:ReadFailures['C:\Fixture\Service.exe'] = 2
+        $script:FileFacts['C:\Fixture\Service.exe'] = [pscustomobject]@{ LengthBytes = [long]65537; LastWriteTimeUtc = '2000-01-01T00:00:00.0000000Z' }
+        $script:FilePayloads['C:\Fixture\Service.exe'] = [byte[]]@()
+        $result = Invoke-TestFileCollection
+        Assert-True ($result.Files.Items[0].HashStatus -eq 'Failed' -and $null -eq $result.Files.Items[0].SHA256)
+        Assert-True ($result.Budget.HashBytesRead -eq 65536 -and $result.Budget.Hashes.UnusableCount -eq 1)
+        Assert-FileReferences $result
+    }
+    Run-Test 'failed reads with position advances count consumed bytes and disposal failures remain isolated' {
+        $script:ReadFailures['C:\Fixture\Service.exe'] = 1; $script:AdvanceBeforeReadFailure = 3
+        $result = Invoke-TestFileCollection
+        Assert-True ($result.Budget.HashBytesRead -eq 3 -and $result.Budget.Hashes.UnusableCount -eq 1 -and $null -eq $result.Files.Items[0].SHA256)
+        $script:ReadFailures.Clear(); $script:AdvanceBeforeReadFailure = 0; $script:FailStreamDispose = $true
+        $result = Invoke-TestFileCollection
+        Assert-True ($result.Files.Items[0].HashStatus -eq 'Failed' -and $null -eq $result.Files.Items[0].SHA256 -and $result.Budget.Hashes.UnusableCount -eq 1)
+        Assert-True ($result.Services.Status -eq 'Success' -and $result.Processes.Status -eq 'Success')
+        Assert-FileReferences $result
+    }
+    Run-Test 'denied stream opens leave metadata usable and publish no hash' {
+        $script:OpenFailures['C:\Fixture\Service.exe'] = $true
+        $result = Invoke-TestFileCollection
+        Assert-True ($result.Files.Items[0].MetadataStatus -eq 'Collected' -and $result.Files.Items[0].HashStatus -eq 'Unavailable')
+        Assert-True ($result.Budget.Hashes.AttemptedCount -eq 1 -and $result.Budget.Hashes.UnusableCount -eq 1 -and $result.Budget.HashBytesRead -eq 0)
+        Assert-FileReferences $result
+    }
+    Run-Test '64 MiB inclusive hash eligibility rejects one byte over without reading that file' {
+        foreach ($size in @([long]67108864, [long]67108865)) {
+            $script:FileFacts['C:\Fixture\Service.exe'] = [pscustomobject]@{ LengthBytes = $size; LastWriteTimeUtc = '2000-01-01T00:00:00.0000000Z' }
+            $script:FilePayloads['C:\Fixture\Service.exe'] = [byte[]]@()
+            $result = Invoke-TestFileCollection
+            if ($size -eq 67108864) { Assert-True ($result.Files.Items[0].HashStatus -eq 'Collected' -and $result.Budget.HashBytesRead -eq 67108864) }
+            else { Assert-True ($result.Files.Items[0].HashStatus -eq 'Skipped' -and $result.Budget.HashBytesRead -eq 0 -and $result.Budget.Hashes.SkippedCount -eq 1) }
+            Assert-True ($script:MaxReadRequest -le 65536)
+            Assert-FileReferences $result
+        }
+    }
+    Run-Test 'aggregate reads stop at 512 MiB and smaller files continue after a larger file is skipped' {
+        $base = $script:FakeServices[0]
+        $script:FakeServices = @(foreach ($number in 0..9) {
+            $row = $base.PSObject.Copy(); $row.Name = 'HashBudget_' + $number; $row.State = 'Stopped'; $row.ProcessId = 0
+            $path = 'C:\Fixture\Budget' + $number + '.exe'; $row.PathName = $path
+            $length = if ($number -eq 9) { [long]1 } elseif ($number -eq 7) { [long]67108863 } else { [long]67108864 }
+            $script:FileFacts[$path] = [pscustomobject]@{ LengthBytes = $length; LastWriteTimeUtc = '2000-01-01T00:00:00.0000000Z' }
+            $script:FilePayloads[$path] = [byte[]]@(); $row
+        })
+        $result = Invoke-TestFileCollection
+        Assert-True ($result.Budget.HashBytesRead -eq 536870912 -and $result.Budget.Hashes.CompletedCount -eq 9 -and $result.Budget.Hashes.SkippedCount -eq 1)
+        Assert-True ($result.Files.Items[8].HashStatus -eq 'Skipped' -and $result.Files.Items[9].LengthBytes -eq 1 -and $result.Files.Items[9].HashStatus -eq 'Collected')
+        Assert-True ($script:MaxReadRequest -le 65536)
+        Assert-FileReferences $result
+    }
+    Run-Test 'exactly 256 paths and one over have consistent selection and omission accounting' {
+        $base = $script:FakeServices[0]
+        foreach ($size in @(256, 257)) {
+            $script:FakeServices = @(for ($number = 0; $number -lt $size; $number++) {
+                $row = $base.PSObject.Copy(); $row.Name = 'Boundary_' + $number; $row.State = 'Stopped'; $row.ProcessId = 0
+                $row.PathName = 'C:\Fixture\Boundary' + $number.ToString('D3') + '.exe'; $row
+            })
+            $result = Invoke-TestFileCollection
+            Assert-True ($result.Files.Count -eq 256 -and $result.Budget.Files.CandidateCount -eq $size -and $result.Budget.Files.SkippedCount -eq $size - 256)
+            Assert-True ($result.Budget.Files.AttemptedCount -eq 256 -and $result.Budget.Hashes.CandidateCount -eq 256)
+            Assert-FileReferences $result
+        }
+    }
+    Run-Test 'path selection boundaries preserve IDs and prefer required service paths over network paths' {
+        $base = $script:FakeServices[0]
+        $script:FakeServices = @(foreach ($number in 0..255) {
+            $row = $base.PSObject.Copy(); $row.Name = 'Other_' + $number; $row.State = 'Stopped'; $row.ProcessId = 0
+            $row.PathName = 'C:\Fixture\A' + $number.ToString('D3') + '.exe'; $row
+        })
+        $running = $base.PSObject.Copy(); $running.PathName = 'C:\Fixture\ZRunning.exe'; $script:FakeServices += $running
+        $process = New-FakeProcessRecord 123; $process.ExecutablePath = 'C:\Fixture\ZRunning.exe'; $script:ProcessRows['123'] = $process
+        $script:FakeEndpoints.TCP = @((New-FakeEndpointRecord 900))
+        $network = New-FakeProcessRecord 900; $network.ExecutablePath = 'C:\Fixture\AAdditional.exe'; $script:ProcessRows['900'] = $network
+        $result = Invoke-TestFileCollection
+        Assert-True ($result.Files.Count -eq 256 -and $result.Budget.Files.CandidateCount -eq 258 -and $result.Budget.Files.SkippedCount -eq 2)
+        Assert-True ($result.Files.Items[0].Path -eq 'C:\Fixture\ZRunning.exe' -and $result.Files.Items[0].Id -eq 'file:258')
+        Assert-True ($null -eq $result.Services.Items[255].FileRecordId -and $null -eq $result.Processes.Items[1].FileRecordId)
+        $omitted = @($script:CollectionIssues | Where-Object { $_.Code -eq 'LimitReached' -and $_.Stage -eq 'Prerequisite' })
+        Assert-True ($omitted.Count -eq 2 -and $omitted[0].SourceRefs.Count -gt 0)
+        Assert-FileReferences $result
+    }
+    Run-Test 'expiration before first path verification counts the skipped path without claiming an empty scope' {
+        $script:FakeServices[0].State = 'Stopped'; $script:FakeServices[0].ProcessId = 0
+        $script:ExpireClockAt = 1
+        $result = Invoke-TestFileCollection
+        Assert-True ($result.Services.Status -eq 'Success' -and $result.Processes.Status -eq 'Success')
+        Assert-True ($result.Files.Status -eq 'Unavailable' -and $null -eq $result.Files.Count -and $null -eq $result.Budget.Files.CandidateCount)
+        Assert-True ($result.Budget.Files.SkippedCount -eq 1 -and $result.Budget.Files.AttemptedCount -eq 0)
+        Assert-True ($script:AttributeCalls.Count -eq 0 -and $script:ContentCalls.Count -eq 0)
+        $issues = @($script:CollectionIssues | Where-Object { $_.DatasetId -eq 'ExecutableFiles' -and $_.Code -eq 'LimitReached' })
+        Assert-True ($issues.Count -eq 1 -and $issues[0].Stage -eq 'Prerequisite' -and $issues[0].SourceRefs.Count -eq 1)
+        Assert-True ($issues[0].SourceRefs[0].RecordId -eq $result.Services.Items[0].Id -and $null -eq $result.Services.Items[0].FileRecordId)
+        Assert-FileReferences $result
+    }
+    Run-Test 'multiple distinct unverified paths are counted separately from unresolved source references' {
+        $base = $script:FakeServices[0]
+        $script:FakeServices = @(foreach ($number in 0..3) {
+            $row = $base.PSObject.Copy(); $row.Name = 'Preflight_' + $number; $row.State = 'Stopped'; $row.ProcessId = 0
+            $row.PathName = if ($number -eq 3) { 'relative.exe' } else { 'C:\Fixture\Preflight' + $number + '.exe' }; $row
+        })
+        $script:ExpireClockAt = 1
+        $result = Invoke-TestFileCollection
+        Assert-True ($result.Budget.Files.SkippedCount -eq 3 -and $null -eq $result.Budget.Files.CandidateCount)
+        Assert-True ($result.Budget.Files.AttemptedCount -eq 0 -and $script:AttributeCalls.Count -eq 0 -and $script:ContentCalls.Count -eq 0)
+        $issues = @($script:CollectionIssues | Where-Object { $_.DatasetId -eq 'ExecutableFiles' -and $_.Code -eq 'LimitReached' })
+        Assert-True ($issues.Count -eq 3 -and @($issues | ForEach-Object { $_.SourceRefs[0].RecordId } | Select-Object -Unique).Count -eq 3)
+        $limits = $result.Files.Limitations -join ' '
+        Assert-True ($limits.Contains('Observed safe distinct paths: 0; excluded/unresolved source references: 1'))
+        Assert-True ($limits.Contains('scheduling-unverified distinct paths: 3 (source references: 3)'))
+        Assert-FileReferences $result
+    }
+    Run-Test 'shared unverified paths count once while preserving all service and process references' {
+        $second = $script:FakeServices[0].PSObject.Copy(); $second.Name = 'Shared'; $second.PathName = 'c:\fixture\SERVICE.exe'
+        $script:FakeServices += $second
+        $script:ExpireClockAt = 1
+        $result = Invoke-TestFileCollection
+        Assert-True ($result.Services.Count -eq 2 -and $result.Processes.Count -eq 1)
+        Assert-True ($result.Budget.Files.SkippedCount -eq 1 -and $null -eq $result.Budget.Files.CandidateCount)
+        Assert-True ($script:AttributeCalls.Count -eq 0 -and $script:ContentCalls.Count -eq 0)
+        $issues = @($script:CollectionIssues | Where-Object { $_.DatasetId -eq 'ExecutableFiles' -and $_.Code -eq 'LimitReached' })
+        Assert-True ($issues.Count -eq 1 -and $issues[0].SourceRefs.Count -eq 3)
+        Assert-True (@($issues[0].SourceRefs | Where-Object { $_.DatasetId -eq 'Services' }).Count -eq 2)
+        Assert-True (@($issues[0].SourceRefs | Where-Object { $_.DatasetId -eq 'Processes' }).Count -eq 1)
+        Assert-True (($result.Files.Limitations -join ' ').Contains('scheduling-unverified distinct paths: 1 (source references: 3)'))
+        Assert-FileReferences $result
+    }
+    Run-Test 'preflight selection-cap and metadata scheduling skips are disjoint without double counting' {
+        $base = $script:FakeServices[0]
+        $script:FakeServices = @(foreach ($number in 0..259) {
+            $row = $base.PSObject.Copy(); $row.Name = 'MixedSkip_' + $number; $row.State = 'Stopped'; $row.ProcessId = 0
+            $row.PathName = 'C:\Fixture\MixedSkip' + $number.ToString('D3') + '.exe'; $row
+        })
+        # 257 verified paths, then three unverified paths; one verified path
+        # exceeds the cap, and all 256 selected metadata operations miss the deadline.
+        $script:ExpireClockAt = 258
+        $result = Invoke-TestFileCollection
+        Assert-True ($null -eq $result.Budget.Files.CandidateCount -and $result.Budget.Files.SkippedCount -eq 260)
+        Assert-True ($result.Budget.Files.AttemptedCount -eq 0 -and $script:ContentCalls.Count -eq 0)
+        Assert-True (-not ($script:AttributeCalls -contains 'C:\Fixture\MixedSkip257.exe'))
+        $preflight = @($script:CollectionIssues | Where-Object { $_.Code -eq 'LimitReached' -and $_.Stage -eq 'Prerequisite' })
+        $metadata = @($script:CollectionIssues | Where-Object { $_.Code -eq 'LimitReached' -and $_.Stage -eq 'Collect' })
+        Assert-True ($preflight.Count -eq 4 -and $metadata.Count -eq 256)
+        $skippedIds = @(@($preflight) + @($metadata) | ForEach-Object { $_.SourceRefs[0].RecordId })
+        Assert-True ($skippedIds.Count -eq 260 -and @($skippedIds | Select-Object -Unique).Count -eq 260)
+        $limits = $result.Files.Limitations -join ' '
+        Assert-True ($limits.Contains('Observed safe distinct paths: 257; excluded/unresolved source references: 0'))
+        Assert-True ($limits.Contains('scheduling-unverified distinct paths: 3 (source references: 3)'))
+        Assert-FileReferences $result
+    }
+    Run-Test 'fully verified candidate counts retain budget identities when metadata scheduling expires' {
+        $base = $script:FakeServices[0]
+        $script:FakeServices = @(foreach ($number in 0..2) {
+            $row = $base.PSObject.Copy(); $row.Name = 'Verified_' + $number; $row.State = 'Stopped'; $row.ProcessId = 0
+            $row.PathName = 'C:\Fixture\Verified' + $number + '.exe'; $row
+        })
+        $script:ExpireClockAt = 4
+        $result = Invoke-TestFileCollection
+        Assert-True ($result.Budget.Files.CandidateCount -eq 3 -and $result.Budget.Files.SkippedCount -eq 3 -and $result.Budget.Files.AttemptedCount -eq 0)
+        Assert-True ($script:ContentCalls.Count -eq 0 -and ($script:AttributeCalls -contains 'C:\Fixture\Verified2.exe'))
+        Assert-True (($result.Files.Limitations -join ' ').Contains('scheduling-unverified distinct paths: 0 (source references: 0)'))
+        Assert-FileReferences $result
+    }
+    Run-Test 'incomplete upstream scope keeps candidate totals unknown even when all observed paths are verified' {
+        $script:CimMode = 'AfterOne'
+        $result = Invoke-TestFileCollection
+        Assert-True ($result.Services.Status -eq 'Partial' -and $null -eq $result.Budget.Files.CandidateCount)
+        Assert-True ($result.Files.Count -eq 1 -and $result.Budget.Files.AttemptedCount -eq 1 -and $result.Budget.Files.SkippedCount -eq 0)
+        Assert-True (($result.Files.Limitations -join ' ').Contains('Observed safe distinct paths: 1; excluded/unresolved source references: 0'))
+        Assert-True (($result.Files.Limitations -join ' ').Contains('scheduling-unverified distinct paths: 0 (source references: 0)'))
+        Assert-FileReferences $result
+    }
+    Run-Test '60-second scheduling stops new operations and discards interrupted streaming hashes' {
+        $script:ExpireClockAt = 2
+        $result = Invoke-TestFileCollection
+        Assert-True ($result.Files.Status -eq 'Unavailable' -and $result.Budget.Files.AttemptedCount -eq 0 -and $result.Budget.Files.SkippedCount -eq 1)
+        Assert-True ($script:ContentCalls.Count -eq 0)
+        $script:ExpireClockAt = 0; $script:FileElapsed = 0; $script:ClockCalls = 0; $script:StopAfterRead = $true
+        $script:FileFacts['C:\Fixture\Service.exe'] = [pscustomobject]@{ LengthBytes = [long]65537; LastWriteTimeUtc = '2000-01-01T00:00:00.0000000Z' }
+        $script:FilePayloads['C:\Fixture\Service.exe'] = [byte[]]@()
+        $result = Invoke-TestFileCollection
+        Assert-True ($result.Files.Items[0].HashStatus -eq 'Skipped' -and $null -eq $result.Files.Items[0].SHA256)
+        Assert-True ($result.Budget.HashBytesRead -eq 65536 -and $result.Budget.Hashes.AttemptedCount -eq 1 -and $result.Budget.Hashes.UnusableCount -eq 1)
+        Assert-FileReferences $result
+    }
+    Run-Test 'unsupported file host and unknown inputs preserve unavailable counts without touching files' {
+        $result = Invoke-TestFileCollection $false
+        Assert-True ($result.Files.Status -eq 'Unavailable' -and $null -eq $result.Files.Count -and $null -eq $result.Budget.Files.CandidateCount -and $script:AttributeCalls.Count -eq 0)
+        $script:FileHostSupported = $true
+        $row = New-FakeProcessRecord 123; $row.ExecutablePath = $null; $script:ProcessRows['123'] = $row
+        $result = Invoke-TestFileCollection
+        Assert-True ($result.Files.Status -eq 'Partial' -and $null -eq $result.Budget.Files.CandidateCount -and $result.Files.Count -eq 1)
+        Assert-True ($null -eq $result.Processes.Items[0].FileRecordId -and $result.Services.Items[0].FileRecordId)
+        Assert-FileReferences $result
+    }
+    Run-Test 'complete empty file candidate scope is success zero and signatures are never invoked' {
+        $script:FakeServices = @()
+        $result = Invoke-TestFileCollection
+        Assert-True ($result.Files.Status -eq 'Success' -and $result.Files.Count -eq 0 -and $result.Budget.Files.CandidateCount -eq 0)
+        Assert-True ($result.Budget.Signatures.AttemptedCount -eq 0 -and $script:SignatureCalls -eq 0)
+        Assert-FileReferences $result
+    }
+    Run-Test 'seven reports preserve file schemas references and JSON-only raw commands' {
+        $script:FileHostSupported = $true
+        $location = New-TestLocation; $report = New-TestReport $location -IncludeFiles
+        Publish-InventoryReports $report $location $script:Allowed
+        $json = [IO.File]::ReadAllText((Join-Path $location.Directory 'service-software.json')) | ConvertFrom-Json
+        $files = @($json.Collection.Datasets | Where-Object { $_.Id -eq 'ExecutableFiles' })[0]
+        $csv = @(Import-Csv -LiteralPath (Join-Path $location.Directory 'files.csv'))
+        Assert-True ($files.Count -eq $csv.Count -and $csv.Count -eq 2 -and $json.Output.Files.Count -eq 7)
+        $references = ConvertFrom-Json -InputObject $csv[0].SourceRefs
+        Assert-True ($references.Count -eq 1 -and $references[0].RecordId)
+        foreach ($name in @('summary.txt', 'services.csv', 'software.csv', 'network-endpoints.csv', 'processes.csv', 'files.csv')) {
+            $text = [IO.File]::ReadAllText((Join-Path $location.Directory $name))
+            Assert-True (-not $text.Contains('SYNTHETIC_SECRET_MARKER') -and -not $text.Contains('SYNTHETIC_PROCESS_SECRET'))
+        }
+        Assert-True ($json.Collection.Status -eq 'Success' -and $files.Status -eq 'Partial' -and $report.Output.Status -eq 'Success')
+        Assert-True ($script:SignatureCalls -eq 0 -and $json.Collection.BudgetUsage.Signatures.AttemptedCount -eq 0)
+    }
+    Run-Test 'files.csv failure prevents canonical publication and supports safe cleanup' {
+        function script:Write-ProtectedReportText {
+            param($Path,$Text,$AllowedSids)
+            if ([IO.Path]::GetFileName($Path) -eq 'files.csv.tmp') { throw 'Synthetic file CSV failure' }
+            & $definitions['Write-ProtectedReportText'] $Path $Text $AllowedSids
+        }
+        $location = New-TestLocation; $report = New-TestReport $location
+        Assert-Throws { Publish-InventoryReports $report $location $script:Allowed }
+        Assert-True ($report.Output.Status -eq 'Failed' -and -not [IO.File]::Exists((Join-Path $location.Directory 'service-software.json')))
+        Remove-IncompleteReportFiles $location $script:Allowed
+        Assert-True (@(Get-ChildItem -LiteralPath $location.Directory -Force).Count -eq 0)
+    }
+    Run-Test 'native read helpers hash only an invocation-owned synthetic file' {
+        $path = Join-Path $script:TestRoot 'SyntheticHash.exe'
+        [IO.File]::WriteAllBytes($path, [Text.Encoding]::UTF8.GetBytes('abc'))
+        foreach ($name in @('Get-ExecutableDriveType', 'Get-ExecutableAttributes', 'Get-ExecutableFacts', 'Open-ExecutableStream')) {
+            Set-Item -Path ('Function:script:' + $name) -Value $definitions[$name]
+        }
+        $facts = Get-ExecutableFacts $path
+        $candidate = [pscustomobject]@{ Path = $path; Row = $facts }
+        $budget = [ordered]@{ HashBytesRead = [long]0 }
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        try { $result = Get-ExecutableHash $candidate $clock $budget }
+        finally { $clock.Stop() }
+        Assert-True ($result.Status -eq 'Collected' -and $result.SHA256 -eq 'BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD' -and $budget.HashBytesRead -eq 3)
     }
     Run-Test 'native location preparation resolves relative roots and avoids collisions' {
         $base = Join-Path $script:TestRoot 'RelativeRoot'
@@ -1085,7 +1575,7 @@ try {
             $first = New-ProtectedReportLocation '.' SYNTHETIC_HOST ([guid]::NewGuid().ToString()) $script:Allowed
             $second = New-ProtectedReportLocation '.' SYNTHETIC_HOST ([guid]::NewGuid().ToString()) $script:Allowed
             Assert-True ([IO.Path]::IsPathRooted($first.Directory) -and $first.Directory -ne $second.Directory)
-            Assert-True ($first.TemporaryPaths.Count -eq 6 -and $second.TemporaryPaths.Count -eq 6)
+            Assert-True ($first.TemporaryPaths.Count -eq 7 -and $second.TemporaryPaths.Count -eq 7)
         }
         finally { Pop-Location }
     }

@@ -1,11 +1,11 @@
 #requires -Version 5.1
 <#
 .SYNOPSIS
-    Collects service, software, and related process inventory (development Milestone 1.2B).
+    Collects service, software, process, and file inventory (development Milestone 1.2C).
 .DESCRIPTION
     Standalone, read-only Windows collector. Raw service commands are saved only in
     restricted JSON. Local endpoint tables provide optional process discovery.
-    Executable-file enrichment is not implemented; this is not a completed release.
+    File enrichment is bounded; native signatures are not invoked. Development release.
 .PARAMETER OutputDir
     Optional local output root. A verified private temporary location is the fallback.
 #>
@@ -17,11 +17,12 @@ function Add-InventoryIssue {
         [ValidateSet('Collection', 'Output')][string]$Kind,
         [AllowNull()][string]$DatasetId,
         [string]$Stage, [string]$Code, [string]$Message,
-        [string]$RecordId
+        [string]$RecordId, [object[]]$SourceRefs
     )
     $issue = [ordered]@{ DatasetId = $DatasetId; Stage = $Stage; Code = $Code; Message = $Message }
     if ([string]::IsNullOrEmpty($DatasetId)) { $issue.DatasetId = $null }
     if ($RecordId) { $issue.RecordId = $RecordId }
+    if ($SourceRefs.Count -gt 0) { $issue.SourceRefs = @($SourceRefs) }
     if ($Kind -eq 'Collection') { $script:CollectionIssues.Add([pscustomobject]$issue) }
     else { $script:OutputIssues.Add([pscustomobject]$issue) }
     # Messages are fixed explanations, never native exception text or command lines.
@@ -173,7 +174,7 @@ function Get-ServiceDataset {
         elseif ($items.Count -gt 0) { 'Partial' }
         elseif ($failure) { $failure } else { 'Failed' }
     $result = New-InventoryDataset Services $true $status $items.ToArray() @(
-        'Milestone 1.2B: configured executable-path resolution and file associations are not implemented.'
+        'Configured paths are resolved conservatively; process paths never substitute for service configuration.'
     )
     $result.Coverage = @([pscustomobject]@{
         SourceId = 'Win32_Service'; Required = $true; Status = $status
@@ -654,6 +655,437 @@ function Get-ProcessDataset {
     $result
 }
 
+function Test-FileEnrichmentHost {
+    [Environment]::Is64BitOperatingSystem -and [Environment]::Is64BitProcess
+}
+
+function Get-WindowsDirectory {
+    [Environment]::GetFolderPath([System.Environment+SpecialFolder]::Windows)
+}
+
+function Resolve-ConfiguredExecutablePath {
+    param([string]$CommandLine)
+    if ([string]::IsNullOrWhiteSpace($CommandLine) -or $CommandLine -match '[\x00-\x1F]') { return $null }
+    $text = $CommandLine.TrimStart()
+    if ($text.StartsWith('"')) {
+        $match = [regex]::Match($text, '^"([^"]+\.(?i:exe|com))"(?=\s|$)')
+    }
+    else {
+        # An explicit executable suffix avoids interpreting C:\Program Files as
+        # C:\Program. Never probe for existing prefixes or search PATH.
+        $match = [regex]::Match($text, '^(\S+\.(?i:exe|com))(?=\s|$)')
+    }
+    if (-not $match.Success) { return $null }
+    $match.Groups[1].Value
+}
+
+function ConvertTo-ExecutablePath {
+    param([string]$Path)
+    $result = [pscustomobject]@{ Path = $null; Code = 'PathUnresolved' }
+    if ([string]::IsNullOrWhiteSpace($Path) -or $Path -match '[\x00-\x1F"*?<>|]') { return $result }
+    $pathText = $Path.Replace('/', '\')
+    if ($pathText -match '(?i)^(?:%SystemRoot%|%windir%|\\SystemRoot)\\') {
+        $prefixLength = $Matches[0].Length
+        $windows = Get-WindowsDirectory
+        if ([string]::IsNullOrEmpty($windows)) { return $result }
+        $pathText = $windows.TrimEnd('\') + '\' + $pathText.Substring($prefixLength)
+    }
+    if ($pathText -notmatch '^[A-Za-z]:\\') {
+        if ($pathText.StartsWith('\')) { $result.Code = 'RemotePathSkipped' }
+        return $result
+    }
+    if ($pathText.Substring(2).Contains(':') -or $pathText.Contains('%') -or $pathText.EndsWith('\')) { return $result }
+    foreach ($part in $pathText.Substring(3).Split('\')) {
+        # Collapsing dot segments before checking reparse components could inspect
+        # a different file than Windows would resolve from the original path.
+        if ($part -in @('.', '..')) { return $result }
+        if ($part -match '[. ]$' -or $part -match '(?i)^(CON(?:IN\$|OUT\$)?|PRN|AUX|NUL|(?:COM|LPT)[0-9\u00B9\u00B2\u00B3])(?:\.|$)') { return $result }
+    }
+    try {
+        $result.Path = [IO.Path]::GetFullPath($pathText)
+        $result.Code = $null
+    }
+    catch { $result.Path = $null }
+    $result
+}
+
+function Get-ExecutableDriveType {
+    param([string]$Root)
+    ([IO.DriveInfo]::new($Root)).DriveType
+}
+
+function Get-ExecutableAttributes {
+    param([string]$Path)
+    [IO.File]::GetAttributes($Path)
+}
+
+function Get-ExecutablePathState {
+    param([string]$Path)
+    # Call only with an already normalized drive-qualified path. No content API
+    # runs until locality and every existing path component have been checked.
+    if ($Path -notmatch '^[A-Za-z]:\\' -or $Path.Substring(2).Contains(':')) { return 'RemotePathSkipped' }
+    $root = [IO.Path]::GetPathRoot($Path)
+    $driveType = Get-ExecutableDriveType $root
+    if ($driveType -notin @([IO.DriveType]::Fixed, [IO.DriveType]::Removable)) { return 'RemotePathSkipped' }
+    $cursor = $root
+    foreach ($part in @('') + @($Path.Substring($root.Length).Split('\') | Where-Object { $_ -ne '' })) {
+        if ($part) { $cursor = [IO.Path]::Combine($cursor, $part) }
+        try { $attributes = Get-ExecutableAttributes $cursor }
+        catch [IO.FileNotFoundException] { return 'Missing' }
+        catch [IO.DirectoryNotFoundException] { return 'Missing' }
+        if (([int]$attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) { return 'ReparsePointSkipped' }
+        $directory = ([int]$attributes -band [int][IO.FileAttributes]::Directory) -ne 0
+        if ($cursor -ne $Path -and -not $directory) { return 'Missing' }
+        if ($cursor -eq $Path -and $directory) { return 'NotFile' }
+    }
+    'Present'
+}
+
+function Get-ExecutableFacts {
+    param([string]$Path)
+    $info = [IO.FileInfo]::new($Path)
+    $info.Refresh()
+    # Length throws for a missing/denied file; FileInfo.Exists would hide errors.
+    [pscustomobject]@{ LengthBytes = [long]$info.Length; LastWriteTimeUtc = $info.LastWriteTimeUtc.ToString('o') }
+}
+
+function Get-ExecutableVersion {
+    param([string]$Path)
+    $version = [Diagnostics.FileVersionInfo]::GetVersionInfo($Path)
+    $values = [ordered]@{}
+    foreach ($field in @('FileVersion', 'ProductVersion', 'CompanyName', 'ProductName')) {
+        $values[$field] = if ([string]::IsNullOrEmpty($version.$field)) { $null } else { $version.$field }
+    }
+    [pscustomobject]$values
+}
+
+function Open-ExecutableStream {
+    param([string]$Path)
+    $share = [IO.FileShare]([int][IO.FileShare]::ReadWrite -bor [int][IO.FileShare]::Delete)
+    # The caller owns the 64 KiB buffer. A one-byte internal buffer avoids
+    # additional managed read-ahead beyond the caller's bounded read request.
+    [IO.FileStream]::new($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share, 1, [IO.FileOptions]::SequentialScan)
+}
+
+function Get-FilePhaseElapsedSeconds {
+    param($Clock)
+    $Clock.Elapsed.TotalSeconds
+}
+
+function Add-ExecutableIssue {
+    param($Candidate, [string]$Stage, [string]$Code, [string]$Message)
+    Add-InventoryIssue -Kind Collection -DatasetId ExecutableFiles -Stage $Stage -Code $Code -Message $Message -RecordId $Candidate.Id -SourceRefs @($Candidate.SourceRefs)
+}
+
+function Get-ExecutableCandidates {
+    param($Services, $Processes, $Clock)
+    $paths = [Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
+    $complete = $Services.Status -eq 'Success' -and $Processes.Status -eq 'Success' -and
+        @($Processes.Coverage | Where-Object { $_.Status -ne 'Success' }).Count -eq 0
+    $excluded = 0; $preflightSkipped = 0; $unverifiedSources = 0; $unexpected = $false
+    foreach ($source in @($Services.Items) + @($Processes.Items)) {
+        $service = $source.Id.StartsWith('service:')
+        $source.FileRecordId = $null
+        $datasetId = if ($service) { 'Services' } else { 'Processes' }
+        $reference = [pscustomobject]@{ DatasetId = $datasetId; RecordId = $source.Id }
+        $diagnostic = [pscustomobject]@{ Id = $null; SourceRefs = @($reference) }
+        if ($service) {
+            $source.ExecutablePath = $null
+            $source.PathResolution = if ($source.RawCommandLineState -eq 'Unavailable') { 'Unavailable' } else { 'Unresolved' }
+            $token = Resolve-ConfiguredExecutablePath $source.RawCommandLine
+        }
+        else { $token = $source.ExecutablePath }
+        $normalized = ConvertTo-ExecutablePath $token
+        if ($null -eq $normalized.Path) {
+            $complete = $false; $excluded++
+            Add-ExecutableIssue $diagnostic Resolve $normalized.Code 'A source executable path could not be resolved safely; no file content was inspected.'
+            continue
+        }
+        if ($service) { $source.ExecutablePath = $normalized.Path; $source.PathResolution = 'Resolved' }
+        $priority = if (($service -and $source.State -eq 'Running') -or (-not $service -and $source.RequiredForCollection)) { 0 }
+            elseif ($service) { 1 } else { 2 }
+        if (-not $paths.ContainsKey($normalized.Path)) {
+            $paths[$normalized.Path] = [pscustomobject]@{
+                Id = $null; Path = $normalized.Path; Priority = $priority; SourceRefs = @(); Owners = @(); Row = $null; HashBlockedReason = $null
+            }
+        }
+        $candidate = $paths[$normalized.Path]
+        if ([StringComparer]::Ordinal.Compare($normalized.Path, $candidate.Path) -lt 0) { $candidate.Path = $normalized.Path }
+        $candidate.Priority = [Math]::Min($candidate.Priority, $priority)
+        $candidate.SourceRefs += $reference
+        $candidate.Owners += $source
+    }
+    $orderedPaths = [string[]]@($paths.Keys)
+    [array]::Sort($orderedPaths, [StringComparer]::OrdinalIgnoreCase)
+    $safe = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($path in $orderedPaths) {
+        $candidate = $paths[$path]
+        $candidate.SourceRefs = @($candidate.SourceRefs | Sort-Object DatasetId,RecordId)
+        if ((Get-FilePhaseElapsedSeconds $Clock) -ge 60) {
+            $complete = $false
+            # This deduplicated path has not been tested for eligibility. It is
+            # disjoint from the verified paths later omitted by the selection cap.
+            $preflightSkipped++
+            $unverifiedSources += $candidate.SourceRefs.Count
+            Add-ExecutableIssue $candidate Prerequisite LimitReached 'Path verification was not started because the file-phase scheduling budget was exhausted.'
+            continue
+        }
+        try {
+            $state = Get-ExecutablePathState $candidate.Path
+            if ($state -notin @('Present', 'Missing')) {
+                $complete = $false; $excluded += $candidate.SourceRefs.Count
+                $code = if ($state -eq 'NotFile') { 'PathUnresolved' } else { $state }
+                Add-ExecutableIssue $candidate Prerequisite $code 'A source path is remote, redirected, unsupported, or not a regular file; no content was inspected.'
+                continue
+            }
+            $safe.Add($candidate)
+        }
+        catch {
+            $complete = $false; $excluded += $candidate.SourceRefs.Count
+            $problem = Get-CollectionFailure $_ RecordReadFailed
+            if ($problem.Status -eq 'Failed') { $unexpected = $true }
+            Add-ExecutableIssue $candidate Prerequisite $problem.Code $problem.Message
+        }
+    }
+    # Stable IDs use the entire safe path-sorted list, before priority/cap selection.
+    for ($index = 0; $index -lt $safe.Count; $index++) { $safe[$index].Id = 'file:' + ($index + 1) }
+    $selectedOrder = @(foreach ($priority in 0..2) { foreach ($candidate in $safe.ToArray()) { if ($candidate.Priority -eq $priority) { $candidate } } })
+    [pscustomobject]@{
+        Candidates = $selectedOrder; Complete = $complete; ExcludedSourceCount = $excluded
+        PreflightSkippedCount = $preflightSkipped; UnverifiedSourceCount = $unverifiedSources; UnexpectedFailure = $unexpected
+    }
+}
+
+function Read-ExecutableMetadata {
+    param($Candidate, $Clock)
+    $state = Get-ExecutablePathState $Candidate.Path
+    if ($state -notin @('Present', 'Missing')) { throw 'ExecutablePathChanged' }
+    $row = [pscustomobject][ordered]@{
+        Id = $Candidate.Id; Path = $Candidate.Path; SourceRefs = @($Candidate.SourceRefs); FileState = $state
+        LengthBytes = $null; LastWriteTimeUtc = $null
+        FileVersion = $null; ProductVersion = $null; CompanyName = $null; ProductName = $null
+        MetadataStatus = 'Collected'; HashStatus = 'Skipped'; SHA256 = $null
+        SignatureMode = 'NotInvoked'; SignatureStatus = 'Skipped'; NativeSignatureStatus = $null; NativeSignatureType = $null
+        SignerSubject = $null; SignerThumbprint = $null; RecordStatus = 'Partial'
+    }
+    if ($state -eq 'Missing') {
+        Add-ExecutableIssue $Candidate Collect FileMissing 'The verified local path did not identify an existing file at collection time.'
+        return $row
+    }
+    try {
+        $facts = Get-ExecutableFacts $Candidate.Path
+        if ($facts.LengthBytes -lt 0) { throw 'ExecutableLengthInvalid' }
+        $row.LengthBytes = $facts.LengthBytes; $row.LastWriteTimeUtc = $facts.LastWriteTimeUtc
+        if ((Get-FilePhaseElapsedSeconds $Clock) -ge 60) {
+            $row.MetadataStatus = 'Skipped'; $Candidate.HashBlockedReason = 'LimitReached'
+            Add-ExecutableIssue $Candidate Collect LimitReached 'Version-resource collection was not started after the file-phase scheduling budget was exhausted.'
+            return $row
+        }
+        if ((Get-ExecutablePathState $Candidate.Path) -ne 'Present') {
+            $row.MetadataStatus = 'Failed'; $Candidate.HashBlockedReason = 'FileChanged'
+            Add-ExecutableIssue $Candidate Collect FileChanged 'The file path changed during metadata collection; no hash will be published.'
+            return $row
+        }
+        $version = Get-ExecutableVersion $Candidate.Path
+        foreach ($field in @('FileVersion', 'ProductVersion', 'CompanyName', 'ProductName')) { $row.$field = $version.$field }
+        if ((Get-ExecutablePathState $Candidate.Path) -ne 'Present') {
+            $row.MetadataStatus = 'Failed'; $Candidate.HashBlockedReason = 'FileChanged'
+            Add-ExecutableIssue $Candidate Collect FileChanged 'The file path changed during metadata collection; no hash will be published.'
+            return $row
+        }
+        $after = Get-ExecutableFacts $Candidate.Path
+        if ($after.LengthBytes -ne $row.LengthBytes -or $after.LastWriteTimeUtc -ne $row.LastWriteTimeUtc) {
+            $row.MetadataStatus = 'Failed'; $Candidate.HashBlockedReason = 'FileChanged'
+            Add-ExecutableIssue $Candidate Collect FileChanged 'The file changed during metadata collection; its hash will not be published.'
+        }
+    }
+    catch {
+        $problem = Get-CollectionFailure $_ RecordReadFailed
+        $row.MetadataStatus = if ($problem.Status -eq 'Unavailable') { 'Unavailable' } else { 'Failed' }
+        $Candidate.HashBlockedReason = $problem.Code
+        Add-ExecutableIssue $Candidate Collect $problem.Code $problem.Message
+    }
+    $row
+}
+
+function Get-ExecutableHash {
+    param($Candidate, $Clock, [System.Collections.IDictionary]$Budget)
+    $stream = $null; $algorithm = $null
+    $result = [pscustomobject]@{ Status = 'Failed'; SHA256 = $null; Code = 'FileChanged' }
+    try {
+        if ((Get-ExecutablePathState $Candidate.Path) -ne 'Present') { return $result }
+        $before = Get-ExecutableFacts $Candidate.Path
+        if ($before.LengthBytes -ne $Candidate.Row.LengthBytes -or $before.LastWriteTimeUtc -ne $Candidate.Row.LastWriteTimeUtc) { return $result }
+        if ((Get-FilePhaseElapsedSeconds $Clock) -ge 60) { $result.Status = 'Skipped'; $result.Code = 'LimitReached'; return $result }
+        $stream = Open-ExecutableStream $Candidate.Path
+        if ($stream.Length -ne $before.LengthBytes) { return $result }
+        $algorithm = [Security.Cryptography.SHA256]::Create()
+        $buffer = New-Object byte[] 65536
+        $readTotal = [long]0
+        while ($readTotal -lt $before.LengthBytes) {
+            $remaining = [long]536870912 - $Budget.HashBytesRead
+            if ((Get-FilePhaseElapsedSeconds $Clock) -ge 60 -or $remaining -le 0) {
+                $result.Status = 'Skipped'; $result.Code = 'LimitReached'; return $result
+            }
+            $requested = [int][Math]::Min([long]$buffer.Length, [Math]::Min($remaining, $before.LengthBytes - $readTotal))
+            $position = $stream.Position
+            try { $count = $stream.Read($buffer, 0, $requested) }
+            catch {
+                # Include any position advance reported by a failed read as well
+                # as all successful reads. No partial digest is retained.
+                $advance = $stream.Position - $position
+                if ($advance -gt 0 -and $advance -le $requested) { $Budget.HashBytesRead += $advance }
+                throw
+            }
+            $Budget.HashBytesRead += $count
+            $readTotal += $count
+            if ($count -le 0) { return $result }
+            [void]$algorithm.TransformBlock($buffer, 0, $count, $buffer, 0)
+        }
+        if ($stream.Length -ne $before.LengthBytes -or (Get-ExecutablePathState $Candidate.Path) -ne 'Present') { return $result }
+        $after = Get-ExecutableFacts $Candidate.Path
+        if ($after.LengthBytes -ne $before.LengthBytes -or $after.LastWriteTimeUtc -ne $before.LastWriteTimeUtc) { return $result }
+        if ((Get-FilePhaseElapsedSeconds $Clock) -ge 60) { $result.Status = 'Skipped'; $result.Code = 'LimitReached'; return $result }
+        [void]$algorithm.TransformFinalBlock([byte[]]@(), 0, 0)
+        $result.SHA256 = [BitConverter]::ToString($algorithm.Hash).Replace('-', '')
+        $result.Status = 'Collected'; $result.Code = $null
+    }
+    catch {
+        $problem = Get-CollectionFailure $_ RecordReadFailed
+        $result.Status = if ($problem.Status -eq 'Unavailable') { 'Unavailable' } else { 'Failed' }
+        $result.Code = $problem.Code
+    }
+    finally {
+        try { if ($null -ne $algorithm) { $algorithm.Dispose() } }
+        finally { if ($null -ne $stream) { $stream.Dispose() } }
+    }
+    $result
+}
+
+function Get-ExecutableDataset {
+    param($Services, $Processes, [System.Collections.IDictionary]$Budget)
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $metadataStarted = $null; $metadataCompleted = $null; $hashStarted = $null; $hashCompleted = $null
+    foreach ($name in @('Files', 'Hashes', 'Signatures')) {
+        $Budget[$name] = [ordered]@{ CandidateCount = $null; AttemptedCount = 0; CompletedCount = 0; UnusableCount = 0; SkippedCount = 0 }
+    }
+    $Budget.HashBytesRead = [long]0; $Budget.FilePhaseElapsedSeconds = 0
+    $rows = New-Object 'System.Collections.Generic.List[object]'
+    $bundle = $null; $selected = @(); $unexpected = $false; $metadataStatus = 'Unavailable'; $hashStatus = 'Unavailable'
+    $status = 'Unavailable'; $definitiveEmpty = $false; $hashFailed = $false
+    try {
+        if (-not (Test-FileEnrichmentHost)) {
+            Add-InventoryIssue Collection ExecutableFiles Prerequisite CapabilityMissing 'File enrichment requires a 64-bit PowerShell process on a 64-bit Windows host; no relaunch was attempted.'
+        }
+        else {
+            $bundle = Get-ExecutableCandidates $Services $Processes $clock
+            $unexpected = $bundle.UnexpectedFailure
+            $all = @($bundle.Candidates)
+            $selected = @($all | Select-Object -First 256)
+            # A safe observed subset is not a complete candidate total when
+            # upstream coverage, resolution, or eligibility remains unknown.
+            if ($bundle.Complete) { $Budget.Files.CandidateCount = $all.Count }
+            $Budget.Files.SkippedCount = $bundle.PreflightSkippedCount + $all.Count - $selected.Count
+            $Budget.Hashes.CandidateCount = $selected.Count; $Budget.Signatures.CandidateCount = $selected.Count
+            $Budget.Signatures.SkippedCount = $selected.Count
+            foreach ($candidate in @($all | Select-Object -Skip 256)) {
+                Add-ExecutableIssue $candidate Prerequisite LimitReached 'Executable metadata was skipped by the 256-path selection limit.'
+            }
+            foreach ($candidate in $selected) {
+                Add-ExecutableIssue $candidate Signature SignatureNetworkPolicy 'Native signature verification was not invoked because Windows trust evaluation may initiate network requests.'
+                if ((Get-FilePhaseElapsedSeconds $clock) -ge 60) {
+                    $Budget.Files.SkippedCount++
+                    $candidate.HashBlockedReason = 'LimitReached'
+                    Add-ExecutableIssue $candidate Collect LimitReached 'Metadata collection was not started after the file-phase scheduling budget was exhausted.'
+                    continue
+                }
+                $Budget.Files.AttemptedCount++
+                if ($null -eq $metadataStarted) { $metadataStarted = [datetime]::UtcNow.ToString('o') }
+                try {
+                    $candidate.Row = Read-ExecutableMetadata $candidate $clock
+                    $rows.Add($candidate.Row)
+                    $Budget.Files.CompletedCount++
+                    foreach ($owner in $candidate.Owners) { $owner.FileRecordId = $candidate.Id }
+                }
+                catch {
+                    $Budget.Files.UnusableCount++
+                    $problem = Get-CollectionFailure $_ RecordReadFailed
+                    $candidate.HashBlockedReason = $problem.Code
+                    if ($problem.Status -eq 'Failed') { $unexpected = $true }
+                    Add-ExecutableIssue $candidate Collect $problem.Code $problem.Message
+                }
+                $metadataCompleted = [datetime]::UtcNow.ToString('o')
+            }
+            # Metadata is completed/scheduled first; hashes follow in the same order.
+            foreach ($candidate in $selected) {
+                $row = $candidate.Row
+                $reason = $null
+                if ($candidate.HashBlockedReason) { $reason = $candidate.HashBlockedReason }
+                elseif ($null -eq $row) { $reason = 'PrerequisiteUnavailable' }
+                elseif ($row.FileState -eq 'Missing') { $reason = 'FileMissing' }
+                elseif ($null -eq $row.LengthBytes) { $reason = 'PrerequisiteUnavailable' }
+                elseif ($row.LengthBytes -gt 67108864) { $reason = 'HashFileTooLarge' }
+                elseif ($row.LengthBytes -gt ([long]536870912 - $Budget.HashBytesRead)) { $reason = 'LimitReached' }
+                elseif ((Get-FilePhaseElapsedSeconds $clock) -ge 60) { $reason = 'LimitReached' }
+                if ($reason) {
+                    $Budget.Hashes.SkippedCount++
+                    Add-ExecutableIssue $candidate Hash $reason 'Hashing was skipped because file eligibility, prerequisites, or a reviewed budget did not permit a complete hash.'
+                    continue
+                }
+                $Budget.Hashes.AttemptedCount++
+                if ($null -eq $hashStarted) { $hashStarted = [datetime]::UtcNow.ToString('o') }
+                try { $hash = Get-ExecutableHash $candidate $clock $Budget }
+                catch {
+                    $problem = Get-CollectionFailure $_ RecordReadFailed
+                    $hash = [pscustomobject]@{ Status = if ($problem.Status -eq 'Unavailable') { 'Unavailable' } else { 'Failed' }; SHA256 = $null; Code = $problem.Code }
+                }
+                $row.HashStatus = $hash.Status; $row.SHA256 = $hash.SHA256
+                if ($hash.Status -eq 'Collected') { $Budget.Hashes.CompletedCount++ }
+                else {
+                    $Budget.Hashes.UnusableCount++
+                    if ($hash.Status -eq 'Failed') { $hashFailed = $true }
+                    Add-ExecutableIssue $candidate Hash $hash.Code 'A complete, unchanged-file SHA256 result could not be confirmed; no hash was published.'
+                }
+                $hashCompleted = [datetime]::UtcNow.ToString('o')
+            }
+            $definitiveEmpty = $bundle.Complete -and $all.Count -eq 0
+            if ($definitiveEmpty) { $status = 'Success'; $metadataStatus = 'Success'; $hashStatus = 'Success' }
+            elseif ($rows.Count -gt 0) {
+                $status = 'Partial' # Signatures are deliberately unavailable under no-network policy.
+                $metadataStatus = if ($bundle.Complete -and $Budget.Files.SkippedCount -eq 0 -and $Budget.Files.UnusableCount -eq 0 -and @($rows.ToArray() | Where-Object { $_.MetadataStatus -ne 'Collected' }).Count -eq 0) { 'Success' } else { 'Partial' }
+                $hashStatus = if ($Budget.Hashes.CompletedCount -gt 0) { 'Partial' } elseif ($hashFailed) { 'Failed' } else { 'Unavailable' }
+                if ($bundle.Complete -and $Budget.Files.SkippedCount -eq 0 -and $Budget.Hashes.CompletedCount -eq $selected.Count) { $hashStatus = 'Success' }
+            }
+            elseif ($unexpected) { $status = 'Failed'; $metadataStatus = 'Failed' }
+        }
+    }
+    catch {
+        $problem = Get-CollectionFailure $_ RecordReadFailed
+        Add-InventoryIssue Collection ExecutableFiles Collect $problem.Code $problem.Message
+        $status = if ($rows.Count -gt 0) { 'Partial' } else { $problem.Status }
+        $metadataStatus = $status
+    }
+    finally { $Budget.FilePhaseElapsedSeconds = Get-FilePhaseElapsedSeconds $clock; $clock.Stop() }
+    $limits = @(
+        'At most 256 paths; running-service paths first, other configured-service paths next, additional-network process paths last; ordinal case-insensitive path order within each tier.'
+        'Hash limits: 64 MiB per file, 512 MiB actual aggregate reads, 64 KiB streaming buffer. Metadata precedes hashes. File-phase scheduling budget: 60 seconds; blocking calls may exceed it.'
+        'Signatures: NotInvoked/Skipped (SignatureNetworkPolicy). The 16-native-invocation allowance is reserved and unused.'
+        'Path/reparse and size/time checks are point-in-time safeguards, not proof of atomic identity or of bytes loaded in memory. No service DLL or software-ownership inference.'
+    )
+    if ($null -ne $bundle) {
+        $limits += 'Observed safe distinct paths: ' + @($bundle.Candidates).Count + '; excluded/unresolved source references: ' + $bundle.ExcludedSourceCount +
+            '; scheduling-unverified distinct paths: ' + $bundle.PreflightSkippedCount + ' (source references: ' + $bundle.UnverifiedSourceCount + '). Unknown full candidate coverage is reported as null.'
+    }
+    $result = New-InventoryDataset ExecutableFiles $false $status $rows.ToArray() $limits
+    $result.Coverage = @(
+        [pscustomobject]@{ SourceId = 'FileMetadata'; Required = $true; Status = $metadataStatus; QueryStartedAt = $metadataStarted; QueryCompletedAt = $metadataCompleted },
+        [pscustomobject]@{ SourceId = 'SHA256'; Required = $true; Status = $hashStatus; QueryStartedAt = $hashStarted; QueryCompletedAt = $hashCompleted },
+        [pscustomobject]@{ SourceId = 'WindowsNativeSignatures'; Required = $true; Status = if ($definitiveEmpty) { 'Success' } else { 'Unavailable' }; QueryStartedAt = $null; QueryCompletedAt = $null }
+    )
+    $result | Add-Member -NotePropertyName SignaturePolicy -NotePropertyValue ([ordered]@{ Status = 'Skipped'; ReasonCode = 'SignatureNetworkPolicy' })
+    $result
+}
+
 function Test-LocalNonReparsePath {
     param([string]$Path, [bool]$MustExist = $true)
     try {
@@ -781,7 +1213,7 @@ function New-ProtectedReportLocation {
             CreatedPaths = (New-Object 'System.Collections.Generic.List[string]')
         }
         Assert-ProtectedReportPath $location.Directory $AllowedSids
-        foreach ($name in @('summary.txt', 'services.csv', 'software.csv', 'network-endpoints.csv', 'processes.csv', 'service-software.json')) {
+        foreach ($name in @('summary.txt', 'services.csv', 'software.csv', 'network-endpoints.csv', 'processes.csv', 'files.csv', 'service-software.json')) {
             $path = [IO.Path]::Combine($location.Directory, ('.' + $name + '.' + $RunId + '.tmp'))
             $stream = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
             $location.CreatedPaths.Add($path)
@@ -797,8 +1229,8 @@ function New-ProtectedReportLocation {
 function Get-ServiceSoftwareSummary {
     param($Report, [switch]$Detailed)
     $lines = New-Object 'System.Collections.Generic.List[string]'
-    $lines.Add('Get-ServiceSoftwareInventory.ps1 0.1.0 - DEVELOPMENT Milestone 1.2B')
-    $lines.Add('Not a completed release: executable-file enrichment is not implemented.')
+    $lines.Add('Get-ServiceSoftwareInventory.ps1 0.1.0 - DEVELOPMENT Milestone 1.2C')
+    $lines.Add('Development release: bounded file metadata/SHA256; signatures are not invoked under no-network policy.')
     $lines.Add('Hostname: ' + $Report.Hostname + '; RunId: ' + $Report.RunId)
     $lines.Add('Collection: ' + $Report.Collection.Status)
     foreach ($dataset in $Report.Collection.Datasets) {
@@ -825,11 +1257,15 @@ function Get-ServiceSoftwareSummary {
         $scope = if ($coverage.Required) { 'required' } else { 'optional' }
         $lines.Add($coverage.SourceId + ' (' + $scope + '): ' + $coverage.Status)
     }
-    foreach ($name in @('ServiceProcesses', 'AdditionalProcesses')) {
+    foreach ($name in @('ServiceProcesses', 'AdditionalProcesses', 'Files', 'Hashes', 'Signatures')) {
         $usage = $Report.Collection.BudgetUsage[$name]
         $candidates = if ($null -eq $usage.CandidateCount) { '<unknown>' } else { [string]$usage.CandidateCount }
         $lines.Add($name + ': candidates=' + $candidates + '; attempted=' + $usage.AttemptedCount + '; completed=' + $usage.CompletedCount + '; unusable=' + $usage.UnusableCount + '; skipped=' + $usage.SkippedCount)
     }
+    $lines.Add('File-phase seconds: ' + $Report.Collection.BudgetUsage.FilePhaseElapsedSeconds + '; actual hash bytes read: ' + $Report.Collection.BudgetUsage.HashBytesRead)
+    $lines.Add('File limits: 256 paths, 64 MiB per hash, 512 MiB actual reads, 60-second scheduling budget. Signature invocations: 0 (reserved limit 16).')
+    $files = @($Report.Collection.Datasets | Where-Object { $_.Id -eq 'ExecutableFiles' })[0]
+    foreach ($coverage in $files.Coverage) { $lines.Add($coverage.SourceId + ': ' + $coverage.Status) }
     $lines.Add('Process queries: all observed running-service PIDs; at most 128 additional PIDs, 32 per batch, CIM timeout request 30 seconds.')
     $lines.Add('PID-only, non-atomic: matching PIDs do not establish individual service endpoint ownership; missing/overlapping creation times cannot exclude reuse.')
     $orderedProcesses = @($processes.Items | Sort-Object @{ Expression = { $_.RequiredForCollection }; Descending = $true }, ProcessId)
@@ -867,6 +1303,17 @@ function Get-ServiceSoftwareSummary {
         foreach ($target in $processes.TargetOutcomes) {
             $lines.Add('- ' + $target.TargetId + '; required: ' + $target.RequiredForCollection + '; outcome: ' + $target.Outcome + '; process reference: ' + $target.ProcessRecordId)
         }
+        $lines.Add(''); $lines.Add('ALL COLLECTED EXECUTABLE FILES (disk observations, not loaded-memory identity)')
+        foreach ($file in $files.Items) {
+            $length = if ($null -eq $file.LengthBytes) { '<unavailable>' } else { [string]$file.LengthBytes }
+            $modified = if ($null -eq $file.LastWriteTimeUtc) { '<unavailable>' } else { $file.LastWriteTimeUtc }
+            $hash = if ($null -eq $file.SHA256) { '<not collected>' } else { $file.SHA256 }
+            $lines.Add('- ' + $file.Id + ': ' + $file.Path + '; state: ' + $file.FileState)
+            $lines.Add('  Bytes: ' + $length + '; modified UTC: ' + $modified + '; metadata: ' + $file.MetadataStatus)
+            $lines.Add('  File version: ' + $file.FileVersion + '; product version: ' + $file.ProductVersion + '; company: ' + $file.CompanyName + '; product: ' + $file.ProductName)
+            $lines.Add('  SHA256 (' + $file.HashStatus + '): ' + $hash + '; signature: ' + $file.SignatureStatus + ' (SignatureNetworkPolicy)')
+            $lines.Add('  Sources: ' + (($file.SourceRefs | ForEach-Object { $_.DatasetId + '/' + $_.RecordId }) -join ', '))
+        }
         $lines.Add('Endpoint details are preserved completely in network-endpoints.csv and service-software.json.')
     }
     $remaining = 10
@@ -896,7 +1343,7 @@ function Convert-InventoryCsv {
     $rows = foreach ($item in $Items) {
         $row = [ordered]@{}
         foreach ($column in $Columns) {
-            if ($column -in @('MissingValueNames', 'SourceKinds', 'RelatedServiceIds', 'EndpointIds')) { $row[$column] = ConvertTo-Json -InputObject @($item.$column) -Compress }
+            if ($column -in @('MissingValueNames', 'SourceKinds', 'RelatedServiceIds', 'EndpointIds', 'SourceRefs')) { $row[$column] = ConvertTo-Json -InputObject @($item.$column) -Compress }
             else { $row[$column] = $item.$column }
         }
         [pscustomobject]$row
@@ -924,10 +1371,12 @@ function Publish-InventoryReports {
     $softwareColumns = 'Id,Name,Version,Publisher,RegistryHive,RegistryView,RegistryKey,SubkeyName,MissingValueNames,RecordStatus'.Split(',')
     $endpointColumns = 'Id,Protocol,EndpointType,LocalAddress,LocalPort,ProcessId,RelatedServiceIds,ServiceAssociationStatus,ProcessRecordId,ProcessAssociationStatus,AssociationBasis,RecordStatus'.Split(',')
     $processColumns = 'Id,ProcessId,Name,ExecutablePath,RawCommandLineState,CreatedAt,RequiredForCollection,SourceKinds,RelatedServiceIds,EndpointIds,AssociationStatus,FileRecordId,RecordStatus'.Split(',')
+    $fileColumns = 'Id,Path,SourceRefs,FileState,LengthBytes,LastWriteTimeUtc,FileVersion,ProductVersion,CompanyName,ProductName,MetadataStatus,HashStatus,SHA256,SignatureMode,SignatureStatus,NativeSignatureStatus,NativeSignatureType,SignerSubject,SignerThumbprint,RecordStatus'.Split(',')
     $services = @($Report.Collection.Datasets | Where-Object { $_.Id -eq 'Services' })[0]
     $software = @($Report.Collection.Datasets | Where-Object { $_.Id -eq 'InstalledSoftware' })[0]
     $endpoints = @($Report.Collection.Datasets | Where-Object { $_.Id -eq 'NetworkEndpoints' })[0]
     $processes = @($Report.Collection.Datasets | Where-Object { $_.Id -eq 'Processes' })[0]
+    $files = @($Report.Collection.Datasets | Where-Object { $_.Id -eq 'ExecutableFiles' })[0]
     $Report.Output.Directory = $Location.Directory
     $Report.Output.ProtectionStatus = 'VerifiedRestricted'
     $Report.Output.Issues = @($script:OutputIssues.ToArray())
@@ -939,6 +1388,7 @@ function Publish-InventoryReports {
         'software.csv' = Convert-InventoryCsv @($software.Items) $softwareColumns
         'network-endpoints.csv' = Convert-InventoryCsv @($endpoints.Items) $endpointColumns
         'processes.csv' = Convert-InventoryCsv @($processes.Items) $processColumns
+        'files.csv' = Convert-InventoryCsv @($files.Items) $fileColumns
     }
     foreach ($name in @($contents.Keys) + @('service-software.json')) {
         $temporaryPath = $Location.TemporaryPaths[$name]
@@ -1032,20 +1482,18 @@ function Invoke-ServiceSoftwareInventory {
     $software = Get-SoftwareDataset
     $endpoints = Get-EndpointDataset
     $processes = Get-ProcessDataset $services $endpoints $budget
-    $files = New-InventoryDataset ExecutableFiles $false Unavailable @() @('NotImplemented: executable-file enrichment is intentionally absent from Milestone 1.2B.')
-    Add-InventoryIssue Collection ExecutableFiles Prerequisite NotImplemented 'Executable-file enrichment is intentionally not implemented in Milestone 1.2B.'
-    $files | Add-Member -NotePropertyName SignaturePolicy -NotePropertyValue ([ordered]@{ Status = 'Skipped'; ReasonCode = 'SignatureNetworkPolicy' })
+    $files = Get-ExecutableDataset $services $processes $budget
     $datasets = @($services, $software, $endpoints, $processes, $files)
     $report = [ordered]@{
         SchemaVersion = '0.1.0'; ModuleId = 'service-software-inventory'; Version = '0.1.0'
-        DevelopmentStage = 'Milestone 1.2B'; ReleaseReady = $false
+        DevelopmentStage = 'Milestone 1.2C'; ReleaseReady = $false
         RunId = $runId; Hostname = $hostname; StartedAt = $started; CompletedAt = [datetime]::UtcNow.ToString('o')
         Collection = [ordered]@{ Status = Get-AggregateStatus $datasets; Datasets = @($datasets); Issues = @($script:CollectionIssues.ToArray()); BudgetUsage = $budget }
         Assessment = [ordered]@{ Status = 'NotPerformed'; Findings = @() }
         Output = [ordered]@{
             Status = 'Failed'; Directory = $location.Directory; FallbackUsed = $fallbackUsed
             ProtectionStatus = 'VerifiedRestricted'
-            Files = @('summary.txt', 'services.csv', 'software.csv', 'network-endpoints.csv', 'processes.csv', 'service-software.json')
+            Files = @('summary.txt', 'services.csv', 'software.csv', 'network-endpoints.csv', 'processes.csv', 'files.csv', 'service-software.json')
             Issues = @($script:OutputIssues.ToArray())
         }
     }

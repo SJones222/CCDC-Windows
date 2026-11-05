@@ -23,7 +23,7 @@ class FoundationSourceTests(unittest.TestCase):
     def test_powershell_51_and_stage_identity(self):
         self.assertTrue(SOURCE.startswith("#requires -Version 5.1\n"))
         for value in ["service-software-inventory", "SchemaVersion = '0.1.0'", "Version = '0.1.0'",
-                      "DevelopmentStage = 'Milestone 1.2B'", "ReleaseReady = $false"]:
+                      "DevelopmentStage = 'Milestone 1.2C'", "ReleaseReady = $false"]:
             self.assertIn(value, SOURCE)
         self.assertNotRegex(SOURCE, r"\?\?|\?\.|ForEach-Object\s+-Parallel|^using namespace")
 
@@ -66,11 +66,11 @@ class FoundationSourceTests(unittest.TestCase):
                            "Import-Module", "Invoke-Expression", "Start-Process"]:
             self.assertNotIn(prohibited, SOURCE)
 
-    def test_only_file_enrichment_remains_an_explicit_placeholder(self):
+    def test_file_enrichment_is_optional_and_signatures_remain_skipped(self):
         self.assertIn("New-InventoryDataset Processes $true $core.Status", SOURCE)
         self.assertIn("New-InventoryDataset NetworkEndpoints $false", SOURCE)
-        self.assertIn("New-InventoryDataset ExecutableFiles $false Unavailable", SOURCE)
-        self.assertEqual(SOURCE.count("Prerequisite NotImplemented"), 1)
+        self.assertIn("New-InventoryDataset ExecutableFiles $false $status", SOURCE)
+        self.assertNotIn("Prerequisite NotImplemented", SOURCE)
         self.assertIn("Status = 'Skipped'; ReasonCode = 'SignatureNetworkPolicy'", SOURCE)
         self.assertIn("Status = 'NotPerformed'; Findings = @()", SOURCE)
 
@@ -117,7 +117,8 @@ class FoundationSourceTests(unittest.TestCase):
     def test_csv_columns_match_approved_spec_and_exclude_raw(self):
         publisher = function("Publish-InventoryReports")
         for name, variable in [("services.csv", "serviceColumns"), ("software.csv", "softwareColumns"),
-                               ("network-endpoints.csv", "endpointColumns"), ("processes.csv", "processColumns")]:
+                               ("network-endpoints.csv", "endpointColumns"), ("processes.csv", "processColumns"),
+                               ("files.csv", "fileColumns")]:
             actual = re.search(r"\$" + variable + r" = '([^']+)'\.Split", publisher).group(1)
             line = next(row for row in SPEC.splitlines() if row.startswith("| `" + name + "` |"))
             expected = line.split("|")[2].strip().strip("`")
@@ -156,7 +157,7 @@ class FoundationSourceTests(unittest.TestCase):
     def test_enum_bitwise_operands_are_integers_for_powershell_51(self):
         enum_masks = [line for line in SOURCE.splitlines()
                       if '-band' in line and re.search(r'\[(?:IO\.FileAttributes|System\.Security\.AccessControl\.(?:AceFlags|ControlFlags))\]::', line)]
-        self.assertEqual(len(enum_masks), 6)
+        self.assertEqual(len(enum_masks), 8)
         for line in enum_masks:
             self.assertRegex(line, r'\[int\]\$(?:attributes|Descriptor\.ControlFlags|ace\.AceFlags)\s+-band\s+\[int\]\[')
 
@@ -220,10 +221,10 @@ class FoundationSourceTests(unittest.TestCase):
         self.assertEqual(main.count("Get-ServiceDataset"), 1)
         self.assertEqual(main.count("Get-SoftwareDataset"), 1)
         self.assertIn("if (-not $report.Output.FallbackUsed)", main)
-        self.assertIn("Files = @('summary.txt', 'services.csv', 'software.csv', 'network-endpoints.csv', 'processes.csv', 'service-software.json')", main)
-        self.assertNotIn("'files.csv'", SOURCE)
+        self.assertIn("Files = @('summary.txt', 'services.csv', 'software.csv', 'network-endpoints.csv', 'processes.csv', 'files.csv', 'service-software.json')", main)
         self.assertEqual(main.count("Get-EndpointDataset"), 1)
         self.assertEqual(main.count("Get-ProcessDataset"), 1)
+        self.assertEqual(main.count("Get-ExecutableDataset"), 1)
 
     def test_provider_helper_checks_scalars_before_success_stream_enumeration(self):
         helper = function("Read-ObservedProperty")
@@ -288,7 +289,100 @@ class FoundationSourceTests(unittest.TestCase):
         self.assertNotIn(".CommandLine", summary)
         self.assertIn("Select-Object -First 10", summary)
         self.assertIn("$remaining = 10", summary)
-        self.assertIn("'MissingValueNames', 'SourceKinds', 'RelatedServiceIds', 'EndpointIds'", function("Convert-InventoryCsv"))
+        self.assertIn("'MissingValueNames', 'SourceKinds', 'RelatedServiceIds', 'EndpointIds', 'SourceRefs'", function("Convert-InventoryCsv"))
+
+    def test_configured_paths_are_parsed_without_search_or_command_execution(self):
+        parser = function("Resolve-ConfiguredExecutablePath")
+        self.assertIn("(?i:exe|com)", parser)
+        self.assertIn("(?=\\s|$)", parser)
+        self.assertNotIn("Test-Path", parser)
+        normalizer = function("ConvertTo-ExecutablePath")
+        self.assertIn("%SystemRoot%|%windir%", normalizer)
+        self.assertIn("Get-WindowsDirectory", normalizer)
+        self.assertNotIn("ExpandEnvironmentVariables", SOURCE)
+        self.assertNotIn("$env:SystemRoot", SOURCE)
+        self.assertIn("PathUnresolved", normalizer)
+        self.assertIn("RemotePathSkipped", normalizer)
+        self.assertIn("CON(?:IN", normalizer)
+
+    def test_content_access_requires_locality_and_component_reparse_checks(self):
+        guard = function("Get-ExecutablePathState")
+        self.assertLess(guard.index("Get-ExecutableDriveType"), guard.index("Get-ExecutableAttributes"))
+        self.assertIn("foreach ($part", guard)
+        self.assertIn("ReparsePointSkipped", guard)
+        self.assertIn("catch [IO.FileNotFoundException]", guard)
+        self.assertNotIn(".Exists", function("Get-ExecutableFacts").split("#")[0])
+        for name in ["Read-ExecutableMetadata", "Get-ExecutableHash"]:
+            self.assertIn("Get-ExecutablePathState", function(name))
+        self.assertIn("Is64BitProcess", function("Test-FileEnrichmentHost"))
+
+    def test_file_order_and_ids_precede_selection_and_preserve_sources(self):
+        candidates = function("Get-ExecutableCandidates")
+        self.assertIn("[StringComparer]::OrdinalIgnoreCase", candidates)
+        self.assertIn("SourceRefs += $reference", candidates)
+        self.assertIn("$source.RequiredForCollection", candidates)
+        self.assertIn("'file:' + ($index + 1)", candidates)
+        self.assertIn("foreach ($priority in 0..2)", candidates)
+        files = function("Get-ExecutableDataset")
+        self.assertIn("Select-Object -First 256", files)
+        self.assertIn("Select-Object -Skip 256", files)
+        self.assertIn("$owner.FileRecordId = $candidate.Id", files)
+        self.assertIn("$bundle.Complete", files)
+
+    def test_hashing_streams_with_exact_actual_byte_and_time_budgets(self):
+        hashing = function("Get-ExecutableHash")
+        for fragment in ["New-Object byte[] 65536", "536870912", "$Budget.HashBytesRead += $count",
+                         "TransformBlock", "TransformFinalBlock", "$stream.Dispose()", "$algorithm.Dispose()"]:
+            self.assertIn(fragment, hashing)
+        self.assertLess(hashing.index("$after = Get-ExecutableFacts"), hashing.index("$result.SHA256 ="))
+        self.assertIn("$stream.Length -ne $before.LengthBytes", hashing)
+        self.assertIn("Get-FilePhaseElapsedSeconds", hashing)
+        files = function("Get-ExecutableDataset")
+        self.assertIn("$row.LengthBytes -gt 67108864", files)
+        self.assertIn("$Budget.Hashes.UnusableCount++", files)
+        self.assertLess(files.index("Read-ExecutableMetadata"), files.index("Get-ExecutableHash"))
+        stream = function("Open-ExecutableStream")
+        self.assertIn("[IO.FileAccess]::Read", stream)
+        self.assertIn("[int][IO.FileShare]::ReadWrite -bor [int][IO.FileShare]::Delete", stream)
+        self.assertNotIn("ReadAllBytes", SOURCE)
+
+    def test_preflight_skips_are_distinct_and_disjoint_from_verified_selection(self):
+        candidates = function("Get-ExecutableCandidates")
+        preflight = candidates.split("if ((Get-FilePhaseElapsedSeconds $Clock) -ge 60) {", 1)[1].split("continue", 1)[0]
+        self.assertIn("$preflightSkipped++", preflight)
+        self.assertIn("$unverifiedSources += $candidate.SourceRefs.Count", preflight)
+        self.assertIn("$complete = $false", preflight)
+        self.assertNotIn("$excluded +=", preflight)
+        self.assertLess(candidates.index("foreach ($path in $orderedPaths)"), candidates.index("$preflightSkipped++"))
+        self.assertLess(candidates.index("$preflightSkipped++"), candidates.index("$state = Get-ExecutablePathState"))
+        self.assertLess(candidates.index("$state = Get-ExecutablePathState"), candidates.index("$safe.Add($candidate)"))
+        files = function("Get-ExecutableDataset")
+        self.assertIn("$Budget.Files.SkippedCount = $bundle.PreflightSkippedCount + $all.Count - $selected.Count", files)
+        self.assertIn("$Budget.Files.SkippedCount++", files)
+
+    def test_candidate_totals_stay_unknown_until_scope_and_path_eligibility_are_complete(self):
+        candidates = function("Get-ExecutableCandidates")
+        self.assertIn("$Services.Status -eq 'Success' -and $Processes.Status -eq 'Success'", candidates)
+        self.assertIn("$Processes.Coverage | Where-Object { $_.Status -ne 'Success' }", candidates)
+        files = function("Get-ExecutableDataset")
+        self.assertIn("CandidateCount = $null", files)
+        self.assertIn("if ($bundle.Complete) { $Budget.Files.CandidateCount = $all.Count }", files)
+        self.assertEqual(files.count("$Budget.Files.CandidateCount ="), 1)
+        for label in ["Observed safe distinct paths:", "excluded/unresolved source references:",
+                      "scheduling-unverified distinct paths:"]:
+            self.assertIn(label, files)
+        # These counters are internal bookkeeping, not new JSON budget fields.
+        for internal in ["PreflightSkippedCount", "UnverifiedSourceCount"]:
+            self.assertNotIn(internal, function("Invoke-ServiceSoftwareInventory"))
+
+    def test_signature_policy_never_invokes_native_trust_and_records_skips(self):
+        metadata = function("Read-ExecutableMetadata")
+        self.assertIn("SignatureMode = 'NotInvoked'; SignatureStatus = 'Skipped'", metadata)
+        files = function("Get-ExecutableDataset")
+        self.assertIn("SignatureNetworkPolicy", files)
+        self.assertIn("$Budget.Signatures.SkippedCount = $selected.Count", files)
+        self.assertNotIn("Signatures.AttemptedCount++", SOURCE)
+        self.assertNotIn("Get-AuthenticodeSignature", SOURCE)
 
     def test_native_suite_has_explicit_windows_host_and_51_constraints(self):
         suite = (ROOT / "Tests/Test-ServiceSoftwareInventory.ps1").read_text()
