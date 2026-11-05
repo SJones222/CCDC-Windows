@@ -285,8 +285,8 @@ function Test-LocalNonReparsePath {
             try { $attributes = [IO.File]::GetAttributes($cursor) }
             catch [IO.FileNotFoundException] { return (-not $MustExist) }
             catch [IO.DirectoryNotFoundException] { return (-not $MustExist) }
-            if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
-            if ($cursor -ne $Path -and ($attributes -band [IO.FileAttributes]::Directory) -eq 0) { return $false }
+            if (([int]$attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
+            if ($cursor -ne $Path -and ([int]$attributes -band [int][IO.FileAttributes]::Directory) -eq 0) { return $false }
         }
         return $true
     }
@@ -296,14 +296,14 @@ function Test-LocalNonReparsePath {
 function Test-RestrictedDescriptor {
     param([System.Security.AccessControl.RawSecurityDescriptor]$Descriptor, [string[]]$AllowedSids, [switch]$Ancestor)
     if ($null -eq $Descriptor.Owner -or $AllowedSids -notcontains $Descriptor.Owner.Value) { return $false }
-    if (($Descriptor.ControlFlags -band [System.Security.AccessControl.ControlFlags]::DiscretionaryAclPresent) -eq 0 -or
+    if (([int]$Descriptor.ControlFlags -band [int][System.Security.AccessControl.ControlFlags]::DiscretionaryAclPresent) -eq 0 -or
         $null -eq $Descriptor.DiscretionaryAcl) { return $false }
     foreach ($ace in $Descriptor.DiscretionaryAcl) {
         # Unknown/callback ACEs are not interpreted as safe; no effective-access engine.
         if ($ace -isnot [System.Security.AccessControl.CommonAce] -or $ace.IsCallback) { return $false }
         if ($ace.AceQualifier -eq [System.Security.AccessControl.AceQualifier]::AccessAllowed) {
             if ($AllowedSids -contains $ace.SecurityIdentifier.Value) { continue }
-            $inheritOnly = ($ace.AceFlags -band [System.Security.AccessControl.AceFlags]::InheritOnly) -ne 0
+            $inheritOnly = (([int]$ace.AceFlags -band [int][System.Security.AccessControl.AceFlags]::InheritOnly) -ne 0)
             if ($Ancestor) {
                 # Other users may read/traverse or create siblings, but not replace
                 # this directory or its protected children, or rewrite its DACL/owner.
@@ -329,8 +329,8 @@ function Assert-ReportAncestors {
         try { $attributes = [IO.File]::GetAttributes($cursor.FullName) }
         catch [IO.DirectoryNotFoundException] { $cursor = $cursor.Parent; continue }
         catch [IO.FileNotFoundException] { $cursor = $cursor.Parent; continue }
-        if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
-            ($attributes -band [IO.FileAttributes]::Directory) -eq 0) { throw 'ReportAncestorUnverified' }
+        if (([int]$attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            ([int]$attributes -band [int][IO.FileAttributes]::Directory) -eq 0) { throw 'ReportAncestorUnverified' }
         $acl = Get-Acl -LiteralPath $cursor.FullName -ErrorAction Stop
         $descriptor = [System.Security.AccessControl.RawSecurityDescriptor]::new($acl.GetSecurityDescriptorBinaryForm(), 0)
         if (-not (Test-RestrictedDescriptor $descriptor $AllowedSids -Ancestor)) { throw 'ReportAncestorUnverified' }

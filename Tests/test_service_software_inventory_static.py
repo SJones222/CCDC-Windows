@@ -128,6 +128,13 @@ class FoundationSourceTests(unittest.TestCase):
         self.assertIn("GetUnresolvedProviderPathFromPSPath", SOURCE)
         self.assertIn("$cursor -ne $Path", local)
 
+    def test_enum_bitwise_operands_are_integers_for_powershell_51(self):
+        enum_masks = [line for line in SOURCE.splitlines()
+                      if '-band' in line and re.search(r'\[(?:IO\.FileAttributes|System\.Security\.AccessControl\.(?:AceFlags|ControlFlags))\]::', line)]
+        self.assertEqual(len(enum_masks), 6)
+        for line in enum_masks:
+            self.assertRegex(line, r'\[int\]\$(?:attributes|Descriptor\.ControlFlags|ace\.AceFlags)\s+-band\s+\[int\]\[')
+
     def test_ancestor_replacement_checks_keep_data_allowlist_strict(self):
         policy = function("Test-RestrictedDescriptor")
         self.assertIn("[switch]$Ancestor", policy)

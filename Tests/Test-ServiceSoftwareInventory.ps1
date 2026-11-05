@@ -279,6 +279,19 @@ try {
         Assert-True ($row.MissingValueNames -contains 'DisplayVersion' -and $row.MissingValueNames -notcontains 'Publisher')
         Assert-True ($script:CollectionIssues[0].Code -eq 'AccessDenied')
     }
+    Run-Test 'PowerShell 5.1 enum masks handle untrusted ACEs with varied inheritance flags' {
+        $sddl = 'O:' + $script:UserSid + 'G:SYD:(A;;FA;;;' + $script:UserSid + ')'
+        foreach ($flags in @('', 'OI', 'CI', 'OICI', 'OICIIO')) {
+            $read = [System.Security.AccessControl.RawSecurityDescriptor]::new(($sddl + '(A;' + $flags + ';FR;;;AU)'))
+            Assert-True ($read.DiscretionaryAcl[1].AceFlags -is [System.Security.AccessControl.AceFlags])
+            Assert-True (-not (Test-RestrictedDescriptor $read $script:Allowed))
+            Assert-True (Test-RestrictedDescriptor $read $script:Allowed -Ancestor)
+            $write = [System.Security.AccessControl.RawSecurityDescriptor]::new(($sddl + '(A;' + $flags + ';FA;;;AU)'))
+            Assert-True (-not (Test-RestrictedDescriptor $write $script:Allowed))
+            $expectedAncestor = $flags -eq 'OICIIO'
+            Assert-True ((Test-RestrictedDescriptor $write $script:Allowed -Ancestor) -eq $expectedAncestor)
+        }
+    }
     Run-Test 'creator-owner inheritance template is not an effective broad grant' {
         $sddl = 'O:' + $script:UserSid + 'G:SYD:(A;;FA;;;' + $script:UserSid + ')'
         $template = [System.Security.AccessControl.RawSecurityDescriptor]::new(($sddl + '(A;OICIIO;FA;;;CO)'))
